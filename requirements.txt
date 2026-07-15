@@ -1,0 +1,17 @@
+streamlit
+python-dotenv
+openai
+anthropic
+langchain
+chromadb
+sentence-transformers
+faiss-cpu
+elevenlabs
+openai-whisper
+pyttsx3
+mediapipe
+opencv-python
+pillow
+cryptography
+bcrypt
+python-telegram-bot
