@@ -254,7 +254,7 @@ def create_owner_twin(profile_id: str = None) -> Orchestrator:
     return twin
 
 
-
+def load_profile(profile_id: str, name: str) -> Orchestrator:
     twin = Orchestrator(profile_id=profile_id, profile_name=name, db=db, embedder_preference="tfidf")
     twin.access_control.set_password("")  # profile switch без пароля (демо-модель довіри в UI-шарі)
     twin.authenticate("password", "")
