@@ -16,10 +16,26 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from digital_twin import (
+from digital_twin_core import (
     Orchestrator, PersonalityConfig, SecurityLevel,
-    BiometricProfile, LegacyProtocol, TwinDatabase, analytics,
+    BiometricProfile, LegacyProtocol, TwinDatabase,
+    emotion_distribution, memory_source_breakdown,
+    conversation_activity_by_day, top_words,
+    response_mode_breakdown, summary_stats,
 )
+
+
+class _AnalyticsNamespace:
+    """Тонка обгортка, щоб зберегти виклики виду analytics.summary_stats(...) в UI-коді."""
+    emotion_distribution = staticmethod(emotion_distribution)
+    memory_source_breakdown = staticmethod(memory_source_breakdown)
+    conversation_activity_by_day = staticmethod(conversation_activity_by_day)
+    top_words = staticmethod(top_words)
+    response_mode_breakdown = staticmethod(response_mode_breakdown)
+    summary_stats = staticmethod(summary_stats)
+
+
+analytics = _AnalyticsNamespace()
 
 DB_PATH = os.environ.get("DIGITAL_TWIN_DB", "digital_twin.db")
 
