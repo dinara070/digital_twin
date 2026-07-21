@@ -13,6 +13,7 @@ import json
 import hashlib
 import uuid
 from datetime import datetime
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -427,45 +428,48 @@ else:
 
         st.markdown("---")
 
-        chat_container = st.container()
-        with chat_container:
-            for msg in st.session_state.chat_history:
-                if msg["role"] == "user":
-                    st.markdown("<div style='display: flex; justify-content: flex-end;'><div class='user-message'>" + msg["content"] + "</div></div>", unsafe_allow_html=True)
-                else:
-                    emotion_class = get_emotion_class(msg.get("emotion", "neutral"))
-                    emotion_emoji = get_emotion_emoji(msg.get("emotion", "neutral"))
-                    badge_html = "<span class='emotion-badge " + emotion_class + "'>" + emotion_emoji + " " + msg.get("emotion", "neutral") + "</span>"
-                    mode_html = ""
-                    if msg.get("mode"):
-                        mode_html = "<span class='mode-badge'>" + ("🤖 LLM" if msg["mode"] == "llm" else "📋 шаблон") + "</span>"
-                    st.markdown("<div style='display: flex; justify-content: flex-start; align-items: center;'><div class='twin-message'>" + msg["content"] + badge_html + mode_html + "</div></div>", unsafe_allow_html=True)
+        def render_twin_message(content: str, emotion: str = "neutral", mode: Optional[str] = None):
+            emoji = get_emotion_emoji(emotion)
+            mode_label = "🤖 LLM" if mode == "llm" else ("📋 шаблон" if mode else "")
+            st.markdown(content)
+            caption = f"{emoji} {emotion}"
+            if mode_label:
+                caption += f" · {mode_label}"
+            st.caption(caption)
 
-        st.markdown("---")
-        with st.form("chat_form", clear_on_submit=True):
-            cols = st.columns([6, 1])
-            with cols[0]:
-                user_input = st.text_input("Ваше повідомлення:", placeholder="Напишіть щось...", label_visibility="collapsed")
-            with cols[1]:
-                submitted = st.form_submit_button("📤", use_container_width=True)
-
-        if submitted and user_input:
-            st.session_state.chat_history.append({"role": "user", "content": user_input, "timestamp": datetime.now().isoformat()})
-            with st.spinner("Двійник думає..."):
-                result = twin.process_message(user_input)
-            if "error" in result:
-                st.error(result["error"])
+        # Історія розмови
+        for msg in st.session_state.chat_history:
+            if msg["role"] == "user":
+                with st.chat_message("user"):
+                    st.markdown(msg["content"])
             else:
-                st.session_state.chat_history.append({
-                    "role": "twin", "content": result.get("text", "..."),
-                    "emotion": result.get("emotion", "neutral"), "mode": result.get("mode"),
-                    "timestamp": datetime.now().isoformat(),
-                })
-                if result.get("llm_error"):
-                    st.caption(f"⚠️ LLM недоступний, використано шаблон: {result['llm_error']}")
-            st.rerun()
+                with st.chat_message("assistant", avatar="🧬"):
+                    render_twin_message(msg["content"], msg.get("emotion", "neutral"), msg.get("mode"))
 
-        st.markdown("---")
+        def send_message(text: str):
+            """Надсилає повідомлення двійнику з живим (стрімінговим) виводом відповіді."""
+            st.session_state.chat_history.append({"role": "user", "content": text, "timestamp": datetime.now().isoformat()})
+            with st.chat_message("user"):
+                st.markdown(text)
+            with st.chat_message("assistant", avatar="🧬"):
+                full_text = st.write_stream(twin.process_message_stream(text))
+                last_turn = twin.cognitive_engine.conversation_history[-1] if twin.cognitive_engine else {}
+                emotion = last_turn.get("emotion", "neutral")
+                mode = last_turn.get("mode")
+                emoji = get_emotion_emoji(emotion)
+                mode_label = "🤖 LLM" if mode == "llm" else ("📋 шаблон" if mode else "")
+                caption = f"{emoji} {emotion}"
+                if mode_label:
+                    caption += f" · {mode_label}"
+                st.caption(caption)
+                if last_turn.get("llm_error"):
+                    st.caption(f"⚠️ LLM недоступний, використано шаблон: {last_turn['llm_error']}")
+            st.session_state.chat_history.append({
+                "role": "twin", "content": full_text,
+                "emotion": emotion, "mode": mode,
+                "timestamp": datetime.now().isoformat(),
+            })
+
         st.markdown("**Швидкі теми:**")
         quick_cols = st.columns(5)
         quick_topics = ["Розкажи про Карпати", "Як ти ставишся до сім'ї?", "Порада щодо роботи",
@@ -473,14 +477,13 @@ else:
         for i, topic in enumerate(quick_topics):
             with quick_cols[i]:
                 if st.button(topic, key=f"quick_{i}", use_container_width=True):
-                    st.session_state.chat_history.append({"role": "user", "content": topic, "timestamp": datetime.now().isoformat()})
-                    result = twin.process_message(topic)
-                    st.session_state.chat_history.append({
-                        "role": "twin", "content": result.get("text", "..."),
-                        "emotion": result.get("emotion", "neutral"), "mode": result.get("mode"),
-                        "timestamp": datetime.now().isoformat(),
-                    })
+                    send_message(topic)
                     st.rerun()
+
+        user_input = st.chat_input("Напишіть щось своєму двійнику...")
+        if user_input:
+            send_message(user_input)
+            st.rerun()
 
     # ========================================
     # TAB: MEMORY
