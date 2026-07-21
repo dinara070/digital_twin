@@ -638,12 +638,12 @@ DEFAULT_MODEL = "claude-sonnet-5"
 
 
 class LLMProvider:
-    """Тонка обгортка над Anthropic Messages API.
+    """Тонка обгортка над Anthropic Messages API (з підтримкою стрімінгу).
 
     Ключ береться з параметра, або зі змінної середовища ANTHROPIC_API_KEY.
     Якщо пакет `anthropic` не встановлено або ключ відсутній — provider
     вважається недоступним (`is_available() == False`), і CognitiveEngine
-    автоматично перейде на шаблонний режим.
+    автоматично перейде на розширений шаблонний режим.
     """
 
     def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_MODEL):
@@ -670,7 +670,7 @@ class LLMProvider:
     def error(self) -> Optional[str]:
         return self._error
 
-    def complete(self, system_prompt: str, messages: List[Dict], max_tokens: int = 400) -> str:
+    def complete(self, system_prompt: str, messages: List[Dict], max_tokens: int = 500) -> str:
         """messages: [{"role": "user"|"assistant", "content": "..."}]"""
         if not self._client:
             raise RuntimeError(self._error or "LLM провайдер недоступний")
@@ -683,6 +683,17 @@ class LLMProvider:
         )
         parts = [block.text for block in response.content if getattr(block, "type", "") == "text"]
         return "".join(parts).strip()
+
+    def stream_complete(self, system_prompt: str, messages: List[Dict], max_tokens: int = 500):
+        """Генератор текстових шматків у реальному часі (для live-виводу в чаті)."""
+        if not self._client:
+            raise RuntimeError(self._error or "LLM провайдер недоступний")
+
+        with self._client.messages.stream(
+            model=self.model, max_tokens=max_tokens, system=system_prompt, messages=messages,
+        ) as stream:
+            for chunk in stream.text_stream:
+                yield chunk
 
     def classify_emotion(self, text: str) -> str:
         """Легка LLM-класифікація емоційного тону тексту (опційно)."""
@@ -705,7 +716,14 @@ class LLMProvider:
 
 
 class CognitiveEngine:
-    """Генерація відповідей на основі особистості, пам'яті та (опційно) LLM."""
+    """Генерація відповідей на основі особистості, пам'яті та (опційно) LLM.
+
+    Двигун здатен вести розмову самостійно навіть без LLM: розширений
+    шаблонний режим розпізнає широкий спектр тем (привітання, почуття,
+    робота, цінності, спогади, довільні питання) і формує змістовну
+    відповідь на основі bio та конфігурації особистості, а не лише
+    короткого канону фраз.
+    """
 
     def __init__(
         self,
@@ -718,38 +736,13 @@ class CognitiveEngine:
         self.llm_provider = llm_provider
         self.emotional_state = EmotionalState()
         self.conversation_history: List[Dict] = []
-        self._response_templates = self._load_templates()
 
-    def _load_templates(self) -> Dict:
-        return {
-            "greeting": [
-                "Привіт! Радий тебе бачити.",
-                "О, привіт! Як справи?",
-                "Здоров був! Чим можу допомогти?",
-            ],
-            "memory_recall": [
-                "О, це нагадує мені про... {memory}",
-                "Знаєш, якось було схоже... {memory}",
-                "Це мені нагадує: {memory}",
-            ],
-            "unknown": [
-                "Чесно кажучи, не пам'ятаю такого.",
-                "Мабуть, це було до мого часу, або я просто забув.",
-                "Не можу пригадати, але звучить цікаво.",
-            ],
-            "opinion": [
-                "Як на мене, {opinion}",
-                "Моя думка така: {opinion}",
-                "Я б сказав, що {opinion}",
-            ],
-        }
-
-    def _retrieve_context(self, query: str, top_k: int = 3) -> List[Dict]:
+    def _retrieve_context(self, query: str, top_k: int = 5) -> List[Dict]:
         memories = self.vector_db.search(query, top_k=top_k)
-        return [m for m in memories if m["similarity"] > 0.15]
+        return [m for m in memories if m["similarity"] > 0.12]
 
     def _apply_personality(self, response: str) -> str:
-        if self.personality.favorite_phrases and secrets.randbelow(100) < 30:
+        if self.personality.favorite_phrases and secrets.randbelow(100) < 25:
             phrase = secrets.choice(self.personality.favorite_phrases)
             response = f"{phrase} {response}"
 
@@ -764,18 +757,112 @@ class CognitiveEngine:
 
         return response
 
-    # ---- Шаблонний (offline) режим ----
-    def _generate_template_response(self, user_input: str, context: List[Dict]) -> str:
-        if any(g in user_input.lower() for g in ["привіт", "здоров", "hi", "hello"]):
-            return secrets.choice(self._response_templates["greeting"])
-        if context:
-            memory_text = context[0]["text"]
-            template = secrets.choice(self._response_templates["memory_recall"])
-            return template.format(memory=memory_text)
+    # ---- Розширений автономний шаблонний режим (без LLM) ----
+    _TOPIC_KEYWORDS = {
+        "greeting": ["привіт", "здоров", "hi", "hello", "добрий день", "доброго дня", "вітаю"],
+        "farewell": ["бувай", "до зустрічі", "па-па", "прощавай", "на все добре", "бай"],
+        "gratitude": ["дякую", "дяки", "спасибі", "вдячн"],
+        "how_are_you": ["як справи", "як ти", "як твої", "як життя", "як почуваєш"],
+        "work": ["робот", "кар'єра", "проєкт", "проект", "продукт", "стартап", "менеджмент"],
+        "study": ["навчання", "вчиш", "вчишся", "матем", "алгоритм", "фізик", "наук", "програмув"],
+        "family": ["сім", "родин", "батьк", "мама", "тато"],
+        "stress": ["стрес", "хвилю", "паніку", "критичн", "терміново", "важко", "втомл"],
+        "sport": ["спорт", "трену", "біга", "фітнес", "плаван"],
+        "values": ["цінност", "принцип", "важлив", "сенс життя", "успіх"],
+        "memory": ["пам'ятаєш", "пригадай", "розкажи про", "нагадай"],
+        "opinion": ["думаєш", "думка", "вважаєш", "як ти ставишся", "твоя позиція"],
+    }
 
+    def _classify_topic(self, text: str) -> str:
+        t = text.lower()
+        for topic, keywords in self._TOPIC_KEYWORDS.items():
+            if any(k in t for k in keywords):
+                return topic
+        return "general"
+
+    def _maybe_follow_up(self) -> str:
+        """Іноді додає запитання-продовження, щоб розмова тривала природно."""
+        if secrets.randbelow(100) < 35:
+            options = [
+                " А як у тебе з цим?",
+                " До речі, а ти як на це дивишся?",
+                " Розкажи, а як у тебе справи з цим?",
+                " Цікаво, що ти думаєш із цього приводу?",
+            ]
+            return secrets.choice(options)
+        return ""
+
+    def _generate_template_response(self, user_input: str, context: List[Dict]) -> str:
+        topic = self._classify_topic(user_input)
+        bio = self.personality.bio.strip()
+
+        if topic == "greeting":
+            base = secrets.choice([
+                "Привіт! Радий(-а) тебе бачити.",
+                "О, привіт! Як справи?",
+                "Здоров був! Чим можу допомогти?",
+            ])
+            return base
+
+        if topic == "farewell":
+            return secrets.choice(["Бувай! До зустрічі.", "На все добре, до наступного разу!", "Па-па!"])
+
+        if topic == "gratitude":
+            return secrets.choice(["Завжди будь ласка!", "Немає за що, звертайся ще.", "Радий(-а) допомогти!"])
+
+        if topic == "how_are_you":
+            mood = {
+                "analytical": "спокійно й зібрано, як завжди намагаюся тримати рівновагу",
+                "emotional": "по-різному, залежно від дня, але стараюся не губити настрій",
+                "avoidant": "нормально, головне — не заглиблюватись у зайве",
+            }.get(self.personality.stress_reaction, "непогано")
+            return f"Все {mood}. А в тебе як справи?"
+
+        if topic == "stress":
+            reaction = {
+                "analytical": "стараюся зберігати спокій, розкласти ситуацію на частини й діяти системно",
+                "emotional": "спершу відчуваю хвилювання, але намагаюся швидко взяти себе в руки",
+                "avoidant": "намагаюся дистанціюватися й повернутися до питання, коли стане спокійніше",
+            }.get(self.personality.stress_reaction, "намагаюся діяти виважено")
+            return f"У стресових ситуаціях я {reaction}." + self._maybe_follow_up()
+
+        if topic == "work" and bio:
+            return (
+                f"Робота і проєкти — це те, чим я живу. {bio.split('.')[0]}." + self._maybe_follow_up()
+            )
+
+        if topic == "study" and bio:
+            sentences = [s.strip() for s in bio.split(".") if s.strip()]
+            relevant = next((s for s in sentences if any(w in s.lower() for w in ["математ", "алгоритм", "фізик", "наук"])), sentences[0] if sentences else "")
+            return (f"{relevant}." if relevant else "Навчання — важлива частина мого життя.") + self._maybe_follow_up()
+
+        if topic == "sport":
+            return "Регулярно займаюся спортом — це частина мого режиму відновлення та концентрації." + self._maybe_follow_up()
+
+        if topic == "values" and bio:
+            sentences = [s.strip() for s in bio.split(".") if s.strip()]
+            relevant = next((s for s in sentences if any(w in s.lower() for w in ["цінност", "цілеспрям", "відповідальн", "вплив"])), None)
+            if relevant:
+                return f"{relevant}." + self._maybe_follow_up()
+
+        if topic == "family":
+            return (
+                "Сім'я — це найголовніше в житті."
+                if self.personality.family_values == "very_important"
+                else "Сім'я важлива, але кожен сам визначає, яку роль вона відіграє."
+            ) + self._maybe_follow_up()
+
+        if (topic in ("memory", "opinion") or context) and context:
+            top = context[0]["text"]
+            if len(context) > 1:
+                combined = " ".join(m["text"] for m in context[:2])
+                return f"Пригадую: {combined}" + self._maybe_follow_up()
+            return f"Це нагадує мені: {top}" + self._maybe_follow_up()
+
+        # Загальний випадок — відповідаємо, спираючись на bio та цінності,
+        # а не заглушкою "не знаю", щоб діалог відчувався живим і самостійним.
         opinion = self._generate_opinion(user_input)
-        template = secrets.choice(self._response_templates["opinion"])
-        return template.format(opinion=opinion)
+        return f"Як на мене, {opinion}." + self._maybe_follow_up()
 
     def _generate_opinion(self, topic: str) -> str:
         t = topic.lower()
@@ -787,10 +874,12 @@ class CognitiveEngine:
         if "сім" in t or "родин" in t:
             return "сім'я — це найголовніше в житті" if self.personality.family_values == "very_important" \
                 else "сім'я важлива, але кожен сам визначає її роль"
+        if self.personality.bio:
+            return self.personality.bio.split(".")[0].strip().lower()
         return "тут важливо подумати з різних боків і знайти баланс"
 
     # ---- LLM-режим ----
-    def _generate_llm_response(self, user_input: str, context: List[Dict]) -> str:
+    def _build_system_prompt(self, context: List[Dict]) -> str:
         system_prompt = self.personality.to_prompt_context()
         if context:
             memory_block = "\n".join(f"- {m['text']}" for m in context)
@@ -799,52 +888,76 @@ class CognitiveEngine:
                 f"якщо це доречно (не цитуй дослівно як список):\n{memory_block}\n"
             )
         system_prompt += (
-            "\nВідповідай від першої особи, коротко (1-4 речення), у своєму стилі. "
+            "\nВідповідай від першої особи, природно і самостійно веди розмову — "
+            "як реальна людина зі своїм характером, а не як асистент. Можеш відповідати "
+            "на будь-які питання, спираючись на свої загальні знання, а не лише на спогади. "
+            "Час від часу став зустрічні запитання, щоб діалог розвивався природно. "
+            "Тримай відповіді стислими (1-5 речень), якщо тема сама не вимагає більшого. "
             "Не згадуй, що ти є AI-моделлю чи цифровим двійником — просто відповідай як людина."
         )
+        return system_prompt
 
-        history = self.conversation_history[-6:]
+    def _build_messages(self, user_input: str, history_len: int = 12) -> List[Dict]:
+        history = self.conversation_history[-history_len:]
         messages = []
         for turn in history:
             messages.append({"role": "user", "content": turn["user"]})
             messages.append({"role": "assistant", "content": turn["twin"]})
         messages.append({"role": "user", "content": user_input})
+        return messages
 
-        return self.llm_provider.complete(system_prompt, messages)
-
-    def generate_response(self, user_input: str) -> str:
-        context = self._retrieve_context(user_input)
-
-        llm_error = None
-        if self.llm_provider and self.llm_provider.is_available():
-            try:
-                response = self._generate_llm_response(user_input, context)
-                emotion = self.llm_provider.classify_emotion(user_input)
-                self.emotional_state.set_emotion(emotion, 0.5, "llm_classified")
-            except Exception as e:  # graceful degrade
-                llm_error = str(e)
-                self.emotional_state.react_to_input(user_input, self.personality)
-                response = self._generate_template_response(user_input, context)
-                response = self._apply_personality(response)
-        else:
-            self.emotional_state.react_to_input(user_input, self.personality)
-            response = self._generate_template_response(user_input, context)
-            response = self._apply_personality(response)
-
-        emotional_prefix = self.emotional_state.get_emotional_prefix()
-        final_response = emotional_prefix + response
-
-        from datetime import datetime
+    def _finalize_turn(self, user_input: str, response_text: str, mode: str, llm_error: Optional[str]):
         self.conversation_history.append({
             "user": user_input,
-            "twin": response,
+            "twin": response_text,
             "emotion": self.emotional_state.current_emotion,
             "timestamp": datetime.now().isoformat(),
-            "mode": "llm" if (self.llm_provider and self.llm_provider.is_available() and not llm_error) else "template",
+            "mode": mode,
             "llm_error": llm_error,
         })
 
-        return final_response
+    def generate_response(self, user_input: str) -> str:
+        """Одноразова (нестрімінгова) генерація — для Telegram/VR/API інтерфейсів."""
+        return "".join(self.generate_response_stream(user_input))
+
+    def generate_response_stream(self, user_input: str):
+        """Генератор шматків тексту — для живого виводу в чаті (Streamlit st.write_stream).
+
+        Для LLM-режиму текст надходить у реальному часі від Anthropic API.
+        Для шаблонного режиму текст віддається одним шматком (генерація миттєва).
+        Побічні ефекти (історія розмови, емоційний стан) застосовуються так само
+        в обох режимах — виклик вважається завершеним, коли генератор вичерпано.
+        """
+        context = self._retrieve_context(user_input)
+
+        if self.llm_provider and self.llm_provider.is_available():
+            try:
+                system_prompt = self._build_system_prompt(context)
+                messages = self._build_messages(user_input)
+
+                chunks: List[str] = []
+                for chunk in self.llm_provider.stream_complete(system_prompt, messages):
+                    chunks.append(chunk)
+                    yield chunk
+                response_text = "".join(chunks).strip()
+
+                emotion = self.llm_provider.classify_emotion(user_input)
+                self.emotional_state.set_emotion(emotion, 0.5, "llm_classified")
+                self._finalize_turn(user_input, response_text, "llm", None)
+                return
+            except Exception as e:  # graceful degrade до шаблонів
+                llm_error = str(e)
+                self.emotional_state.react_to_input(user_input, self.personality)
+                response_text = self._apply_personality(self._generate_template_response(user_input, context))
+                yield response_text
+                self._finalize_turn(user_input, response_text, "template", llm_error)
+                return
+
+        self.emotional_state.react_to_input(user_input, self.personality)
+        response_text = self._apply_personality(self._generate_template_response(user_input, context))
+        yield response_text
+        self._finalize_turn(user_input, response_text, "template", None)
+
 
 # ============================================================================
 # MODULE: IDENTITY — Візуальна та звукова ідентичність двійника (голос, 3D-аватар, мова тіла).
@@ -1325,6 +1438,48 @@ class Orchestrator:
                 "timestamp": datetime.now().isoformat(),
                 "session_stats": {"total_interactions": self.state["total_interactions"]},
             }
+
+    def process_message_stream(self, user_input: str, user_id: str = "default"):
+        """Потокова версія process_message — для живого виводу тексту в чаті.
+
+        Генерує шматки тексту одразу, як вони приходять від LLM (або миттєво
+        для шаблонного режиму). Побічні ефекти (збереження в БД, оновлення
+        аватара/емоцій) виконуються один раз, коли генератор повністю вичерпано —
+        тобто після того, як увесь текст показано користувачу.
+        """
+        if not self.access_control.check_permission("talk"):
+            yield "Доступ заборонено. Авторизуйтесь."
+            return
+        if not self.cognitive_engine:
+            yield "Особистість не ініціалізована."
+            return
+
+        with self._lock:
+            self.state["last_interaction"] = datetime.now().isoformat()
+            self.state["total_interactions"] += 1
+
+        for chunk in self.cognitive_engine.generate_response_stream(user_input):
+            yield chunk
+
+        with self._lock:
+            current_emotion = self.cognitive_engine.emotional_state.current_emotion
+            self.avatar.set_expression(current_emotion)
+            self.body_language.get_gesture_for_emotion(current_emotion)
+            self.legacy.check_activation(self.state)
+
+            last_turn = self.cognitive_engine.conversation_history[-1]
+            if self.autosave:
+                self.db.append_conversation(
+                    self.profile_id, user_input, last_turn["twin"],
+                    current_emotion, last_turn.get("mode", "template"),
+                )
+                self.db.append_emotion(
+                    self.profile_id, current_emotion,
+                    self.cognitive_engine.emotional_state.emotion_intensity,
+                    (self.cognitive_engine.emotional_state.emotion_history[-1].get("trigger", "")
+                     if self.cognitive_engine.emotional_state.emotion_history else ""),
+                )
+                self.db.touch_profile(self.profile_id)
 
     # ---- Пам'ять ----
     def import_memories(self, source_type: str, data: List[Dict]):
