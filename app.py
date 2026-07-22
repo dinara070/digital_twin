@@ -20,9 +20,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from digital_twin_core import (
     Orchestrator, PersonalityConfig, SecurityLevel,
     BiometricProfile, LegacyProtocol, TwinDatabase,
+    PERSONALITY_PRESETS,
     emotion_distribution, memory_source_breakdown,
     conversation_activity_by_day, top_words,
     response_mode_breakdown, summary_stats,
+    emotion_valence_timeline, activity_by_hour,
+    message_length_stats, pinned_memories,
 )
 
 
@@ -34,6 +37,10 @@ class _AnalyticsNamespace:
     top_words = staticmethod(top_words)
     response_mode_breakdown = staticmethod(response_mode_breakdown)
     summary_stats = staticmethod(summary_stats)
+    emotion_valence_timeline = staticmethod(emotion_valence_timeline)
+    activity_by_hour = staticmethod(activity_by_hour)
+    message_length_stats = staticmethod(message_length_stats)
+    pinned_memories = staticmethod(pinned_memories)
 
 
 analytics = _AnalyticsNamespace()
@@ -86,6 +93,7 @@ def init_session_state():
         "chat_history": [],
         "current_tab": "chat",
         "demo_mode": False,
+        "pending_regenerate": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -426,25 +434,62 @@ else:
             llm_label = "🤖 LLM" if status["llm"]["available"] else "📋 Шаблони"
             st.metric("Режим відповідей", llm_label)
 
+        ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
+        with ctrl_col1:
+            if st.button("🗑️ Очистити історію", use_container_width=True, disabled=not st.session_state.chat_history):
+                twin.clear_conversation()
+                st.session_state.chat_history = []
+                st.rerun()
+        with ctrl_col2:
+            can_regenerate = len(st.session_state.chat_history) >= 2
+            if st.button("🔄 Перегенерувати останню", use_container_width=True, disabled=not can_regenerate):
+                st.session_state.chat_history = st.session_state.chat_history[:-2]
+                last_user_msg = twin.pop_last_turn()
+                if last_user_msg:
+                    st.session_state.pending_regenerate = last_user_msg
+                st.rerun()
+        with ctrl_col3:
+            transcript = "\n\n".join(
+                f"{'Ви' if m['role'] == 'user' else 'Двійник'}: {m['content']}"
+                for m in st.session_state.chat_history
+            )
+            st.download_button("⬇️ Експортувати чат", data=transcript or "Історія порожня",
+                                file_name=f"chat_{twin.profile_id}.txt", mime="text/plain",
+                                use_container_width=True, disabled=not st.session_state.chat_history)
+
         st.markdown("---")
 
-        def render_twin_message(content: str, emotion: str = "neutral", mode: Optional[str] = None):
+        chat_search = st.text_input("🔍 Пошук у чаті:", placeholder="Введіть слово, щоб знайти в історії...", key="chat_search")
+
+        def render_twin_message(content: str, emotion: str = "neutral", mode: Optional[str] = None, msg_key: str = ""):
             emoji = get_emotion_emoji(emotion)
             mode_label = "🤖 LLM" if mode == "llm" else ("📋 шаблон" if mode else "")
             st.markdown(content)
             caption = f"{emoji} {emotion}"
             if mode_label:
                 caption += f" · {mode_label}"
-            st.caption(caption)
+            cap_col, btn_col = st.columns([5, 1])
+            with cap_col:
+                st.caption(caption)
+            with btn_col:
+                if msg_key and st.button("💾", key="pin_" + msg_key, help="Зберегти цю репліку як спогад"):
+                    twin.save_text_as_memory(content, source="chat")
+                    st.toast("Збережено як спогад!")
 
-        # Історія розмови
-        for msg in st.session_state.chat_history:
+        # Історія розмови (з опційним фільтром пошуку)
+        visible_history = st.session_state.chat_history
+        if chat_search:
+            q = chat_search.lower()
+            visible_history = [m for m in st.session_state.chat_history if q in m["content"].lower()]
+            st.caption(f"Знайдено {len(visible_history)} повідомлень із «{chat_search}»")
+
+        for idx, msg in enumerate(visible_history):
             if msg["role"] == "user":
                 with st.chat_message("user"):
                     st.markdown(msg["content"])
             else:
                 with st.chat_message("assistant", avatar="🧬"):
-                    render_twin_message(msg["content"], msg.get("emotion", "neutral"), msg.get("mode"))
+                    render_twin_message(msg["content"], msg.get("emotion", "neutral"), msg.get("mode"), msg_key=f"hist_{idx}")
 
         def send_message(text: str):
             """Надсилає повідомлення двійнику з живим (стрімінговим) виводом відповіді."""
@@ -480,6 +525,12 @@ else:
                     send_message(topic)
                     st.rerun()
 
+        if st.session_state.pending_regenerate:
+            pending_text = st.session_state.pending_regenerate
+            st.session_state.pending_regenerate = None
+            send_message(pending_text)
+            st.rerun()
+
         user_input = st.chat_input("Напишіть щось своєму двійнику...")
         if user_input:
             send_message(user_input)
@@ -492,57 +543,122 @@ else:
         st.markdown("### 🧠 База знань та спогадів")
         st.caption(f"Embedding-бекенд: **{twin.vector_db.embedder.name}**")
 
-        tabs = st.tabs(["📚 Перегляд", "➕ Імпорт", "🔍 Пошук", "📤 Повний експорт/імпорт"])
+        tabs = st.tabs(["📚 Перегляд", "⭐ Закріплені", "➕ Імпорт", "🔍 Пошук", "📤 Повний експорт/імпорт"])
 
         with tabs[0]:
             memories = twin.vector_db.get_all_memories()
+            source_icons = {"diary": "📔", "messages": "💬", "calendar": "📅",
+                             "social_media": "📱", "books": "📖", "photos": "📷", "email": "✉️", "chat": "💬"}
             if memories:
-                st.success("Знайдено " + str(len(memories)) + " спогадів")
-                for mem in memories:
+                total_words = sum(len(m["text"].split()) for m in memories)
+                stat_c1, stat_c2, stat_c3 = st.columns(3)
+                with stat_c1:
+                    st.metric("Усього спогадів", len(memories))
+                with stat_c2:
+                    st.metric("Слів у пам'яті", total_words)
+                with stat_c3:
+                    st.metric("Закріплено", len(analytics.pinned_memories(memories)))
+
+                all_sources = sorted({m.get("metadata", {}).get("source", "невідомо") for m in memories})
+                selected_sources = st.multiselect("Фільтр за джерелом:", all_sources, default=all_sources)
+                filtered = [m for m in memories if m.get("metadata", {}).get("source", "невідомо") in selected_sources]
+
+                st.success(f"Показано {len(filtered)} з {len(memories)} спогадів")
+                security_options = [s.value for s in SecurityLevel]
+                for mem in filtered:
                     source = mem.get("metadata", {}).get("source", "невідомо")
-                    source_icons = {"diary": "📔", "messages": "💬", "calendar": "📅",
-                                     "social_media": "📱", "books": "📖", "photos": "📷", "email": "✉️"}
                     icon = source_icons.get(source, "📝")
-                    col_a, col_b = st.columns([9, 1])
-                    with col_a:
-                        mem_html = "<div class='memory-item'><div class='memory-source'>" + icon + " " + source.upper() + "</div><div>" + mem["text"][:200]
-                        if len(mem["text"]) > 200:
-                            mem_html += "..."
-                        mem_html += "</div></div>"
-                        st.markdown(mem_html, unsafe_allow_html=True)
-                    with col_b:
-                        if st.button("🗑️", key="del_" + mem["id"]):
-                            twin.delete_memory(mem["id"])
-                            st.rerun()
+                    pin_mark = "⭐ " if mem.get("metadata", {}).get("pinned") else ""
+                    with st.expander(f"{pin_mark}{icon} {source.upper()} — {mem['text'][:60]}{'...' if len(mem['text']) > 60 else ''}"):
+                        edit_key = "edit_text_" + mem["id"]
+                        new_text = st.text_area("Текст спогаду:", value=mem["text"], key=edit_key, height=80)
+
+                        tags_key = "tags_" + mem["id"]
+                        current_tags = ", ".join(mem.get("metadata", {}).get("tags", []))
+                        new_tags = st.text_input("Теги (через кому):", value=current_tags, key=tags_key)
+
+                        sec_key = "sec_" + mem["id"]
+                        current_sec = mem.get("metadata", {}).get("security", "public")
+                        new_sec = st.selectbox("Рівень безпеки:", security_options,
+                                                index=security_options.index(current_sec) if current_sec in security_options else 0,
+                                                key=sec_key)
+
+                        col_pin, col_save, col_del = st.columns(3)
+                        with col_pin:
+                            pin_label = "📌 Відкріпити" if mem.get("metadata", {}).get("pinned") else "⭐ Закріпити"
+                            if st.button(pin_label, key="pin_mem_" + mem["id"], use_container_width=True):
+                                twin.toggle_memory_pin(mem["id"])
+                                st.rerun()
+                        with col_save:
+                            if st.button("💾 Зберегти зміни", key="save_" + mem["id"], use_container_width=True):
+                                if new_text != mem["text"]:
+                                    twin.update_memory(mem["id"], new_text)
+                                tag_list = [t.strip() for t in new_tags.split(",") if t.strip()]
+                                twin.update_memory_metadata(mem["id"], {"tags": tag_list, "security": new_sec})
+                                st.success("Оновлено!")
+                                st.rerun()
+                        with col_del:
+                            if st.button("🗑️ Видалити", key="del_" + mem["id"], use_container_width=True):
+                                twin.delete_memory(mem["id"])
+                                st.rerun()
             else:
                 st.info("Спогадів ще немає. Імпортуйте дані у вкладці 'Імпорт'.")
 
         with tabs[1]:
+            st.markdown("#### ⭐ Закріплені спогади")
+            st.caption("Найважливіші спогади, позначені зіркою — швидкий доступ без фільтрів.")
+            pinned = analytics.pinned_memories(twin.vector_db.get_all_memories())
+            if pinned:
+                for mem in pinned:
+                    source = mem.get("metadata", {}).get("source", "невідомо")
+                    icon = source_icons.get(source, "📝")
+                    st.markdown(f"**{icon} {source.upper()}**")
+                    st.markdown(mem["text"])
+                    if mem.get("metadata", {}).get("tags"):
+                        st.caption("Теги: " + ", ".join(mem["metadata"]["tags"]))
+                    if st.button("📌 Відкріпити", key="unpin_" + mem["id"]):
+                        twin.toggle_memory_pin(mem["id"])
+                        st.rerun()
+                    st.markdown("---")
+            else:
+                st.info("Ще немає закріплених спогадів — натисніть ⭐ біля будь-якого запису у вкладці «Перегляд».")
+
+        with tabs[2]:
             st.markdown("#### Імпорт спогадів")
             import_type = st.selectbox("Джерело даних:", ["Щоденник", "Повідомлення", "Календар", "Соцмережі", "Книги", "Email"])
             source_map = {"Щоденник": "diary", "Повідомлення": "messages", "Календар": "calendar",
                           "Соцмережі": "social_media", "Книги": "books", "Email": "email"}
-            data_input = st.text_area("Вставте дані (JSON формат):", height=200,
-                                       placeholder='[\n  {"date": "2024-01-01", "content": "Текст запису"}\n]')
+
+            import_mode = st.radio("Спосіб імпорту:", ["Вставити JSON", "Завантажити файл"], horizontal=True)
+            data_input = None
+            if import_mode == "Вставити JSON":
+                data_input = st.text_area("Вставте дані (JSON формат):", height=200,
+                                           placeholder='[\n  {"date": "2024-01-01", "content": "Текст запису"}\n]')
+            else:
+                uploaded_json = st.file_uploader("Оберіть .json файл зі списком записів:", type=["json"], key="mem_upload")
+                if uploaded_json:
+                    data_input = uploaded_json.read().decode("utf-8")
+
             if st.button("📥 Імпортувати", use_container_width=True):
                 try:
                     data = json.loads(data_input) if data_input else []
-                    if isinstance(data, list):
+                    if isinstance(data, list) and data:
                         twin.import_memories(source_map[import_type], data)
                         st.success("✅ Імпортовано " + str(len(data)) + " записів!")
                         st.rerun()
                     else:
-                        st.error("Дані мають бути масивом (списком)")
+                        st.error("Дані мають бути непорожнім масивом (списком)")
                 except json.JSONDecodeError:
                     st.error("❌ Невірний JSON формат")
                 except Exception as e:
                     st.error("❌ Помилка: " + str(e))
 
-        with tabs[2]:
+        with tabs[3]:
             st.markdown("#### Пошук по спогадах")
             search_query = st.text_input("Запит:", placeholder="Наприклад: 'Карпати', 'робота', 'сім'я'")
+            top_k = st.slider("Кількість результатів:", 1, 15, 5)
             if search_query:
-                results = twin.vector_db.search(search_query, top_k=5)
+                results = twin.vector_db.search(search_query, top_k=top_k)
                 if results:
                     st.success("Знайдено " + str(len(results)) + " результатів")
                     for r in results:
@@ -555,7 +671,7 @@ else:
                 else:
                     st.warning("Нічого не знайдено")
 
-        with tabs[3]:
+        with tabs[4]:
             st.markdown("#### Повний експорт / імпорт стану двійника")
             st.caption("Включає особистість, спогади, історію розмов та емоцій, налаштування спадщини.")
             level = st.selectbox("Рівень для експорту:", [SecurityLevel.PUBLIC, SecurityLevel.FAMILY,
@@ -582,55 +698,134 @@ else:
     elif st.session_state.current_tab == "⚙️ Особистість":
         st.markdown("### ⚙️ Налаштування особистості")
 
+        p = twin.personality
+
+        st.markdown("#### ⚡ Швидкі архетипи")
+        st.caption("Одним кліком застосовує готовий набір рис мовлення та поведінки (bio та улюблені фрази залишаються без змін).")
+        preset_cols = st.columns(len(PERSONALITY_PRESETS))
+        preset_icons = {"Аналітик": "🧮", "Комунікатор": "🗣️", "Творча особистість": "🎨", "Лідер": "🚀"}
+        for col, name in zip(preset_cols, PERSONALITY_PRESETS.keys()):
+            with col:
+                if st.button(f"{preset_icons.get(name, '⚡')} {name}", use_container_width=True, key="quickpreset_" + name):
+                    twin.apply_builtin_preset(name)
+                    st.success(f"Застосовано архетип «{name}»")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 💼 Збережені пресети")
+        preset_col1, preset_col2 = st.columns([2, 1])
+        with preset_col1:
+            presets = twin.list_personality_presets()
+            if presets:
+                preset_options = {f"{pr['name']} ({pr['created_at'][:10]})": pr["id"] for pr in presets}
+                chosen = st.selectbox("Збережені пресети:", list(preset_options.keys()))
+                col_apply, col_delete = st.columns(2)
+                with col_apply:
+                    if st.button("📂 Застосувати пресет", use_container_width=True):
+                        twin.apply_personality_preset(preset_options[chosen])
+                        st.success("Пресет застосовано!")
+                        st.rerun()
+                with col_delete:
+                    if st.button("🗑️ Видалити пресет", use_container_width=True):
+                        twin.delete_personality_preset(preset_options[chosen])
+                        st.rerun()
+            else:
+                st.caption("Ще немає збережених пресетів — налаштуйте особистість нижче і збережіть як пресет.")
+        with preset_col2:
+            new_preset_name = st.text_input("Назва нового пресету:", placeholder="напр. «Робочий режим»")
+            if st.button("💾 Зберегти поточну як пресет", use_container_width=True, disabled=not new_preset_name):
+                twin.save_personality_preset(new_preset_name)
+                st.success(f"Збережено пресет «{new_preset_name}»")
+                st.rerun()
+
+        if st.button("🎲 Згенерувати випадкову особистість (для тестування)"):
+            import random
+            random_personality = PersonalityConfig(
+                vocabulary_style=random.choice(["formal", "casual", "slang", "poetic"]),
+                favorite_phrases=random.sample(["Знаєш...", "Чесно кажучи,", "Уяви собі,", "Насправді"], 2),
+                speech_formality=round(random.uniform(0, 1), 2),
+                humor_level=round(random.uniform(0, 1), 2),
+                political_stance=random.choice(["conservative", "liberal", "neutral"]),
+                religious_views=random.choice(["religious", "agnostic", "atheist"]),
+                work_ethic=random.choice(["dedicated", "balanced", "relaxed"]),
+                family_values=random.choice(["very_important", "important", "moderate"]),
+                stress_reaction=random.choice(["analytical", "emotional", "avoidant"]),
+                joy_expression=random.choice(["enthusiastic", "calm", "reserved"]),
+                criticism_response=random.choice(["defensive", "accepting", "dismissive"]),
+                common_words=random.sample(["цікаво", "звичайно", "мабуть", "справді", "взагалі"], 3),
+                bio=p.bio,
+            )
+            twin.initialize_personality(random_personality)
+            st.rerun()
+
+        st.markdown("---")
         with st.form("personality_form"):
             st.markdown("#### 🎭 Мовні характеристики")
+            vocab_options = ["formal", "casual", "slang", "poetic"]
+            political_options = ["conservative", "liberal", "neutral"]
+            religious_options = ["religious", "agnostic", "atheist"]
+            work_options = ["dedicated", "balanced", "relaxed"]
+            family_options = ["very_important", "important", "moderate"]
+            stress_options = ["analytical", "emotional", "avoidant"]
+            joy_options = ["enthusiastic", "calm", "reserved"]
+            criticism_options = ["defensive", "accepting", "dismissive"]
+
             col1, col2 = st.columns(2)
             with col1:
-                vocab_style = st.selectbox("Стиль мовлення:", ["formal", "casual", "slang", "poetic"], index=1)
-                formality = st.slider("Рівень формальності:", 0.0, 1.0, 0.3)
-                humor = st.slider("Почуття гумору:", 0.0, 1.0, 0.7)
+                vocab_style = st.selectbox("Стиль мовлення:", vocab_options,
+                                            index=vocab_options.index(p.vocabulary_style) if p.vocabulary_style in vocab_options else 1)
+                formality = st.slider("Рівень формальності:", 0.0, 1.0, p.speech_formality)
+                humor = st.slider("Почуття гумору:", 0.0, 1.0, p.humor_level)
             with col2:
-                fav_phrases = st.text_area("Улюблені фрази (через кому):", value="Знаєш..., Як на мене, Цікава думка")
-                common_words = st.text_area("Часто вживані слова:", value="так, звичайно, цікаво, взагалі")
+                fav_phrases = st.text_area("Улюблені фрази (через кому):", value=", ".join(p.favorite_phrases))
+                common_words = st.text_area("Часто вживані слова:", value=", ".join(p.common_words))
 
             bio = st.text_area("Біографія / контекст для LLM:",
                                 placeholder="Коротка розповідь про себе — професія, звички, історія...",
-                                value=twin.personality.bio if twin.personality else "")
+                                value=p.bio, height=120)
 
             st.markdown("#### 🏛️ Цінності та переконання")
             col3, col4 = st.columns(2)
             with col3:
-                political = st.selectbox("Політичні погляди:", ["conservative", "liberal", "neutral"], index=1)
-                religious = st.selectbox("Релігійні погляди:", ["religious", "agnostic", "atheist"], index=1)
+                political = st.selectbox("Політичні погляди:", political_options,
+                                          index=political_options.index(p.political_stance) if p.political_stance in political_options else 2)
+                religious = st.selectbox("Релігійні погляди:", religious_options,
+                                          index=religious_options.index(p.religious_views) if p.religious_views in religious_options else 1)
             with col4:
-                work_ethic = st.selectbox("Ставлення до роботи:", ["dedicated", "balanced", "relaxed"], index=1)
-                family = st.selectbox("Сімейні цінності:", ["very_important", "important", "moderate"], index=0)
+                work_ethic = st.selectbox("Ставлення до роботи:", work_options,
+                                           index=work_options.index(p.work_ethic) if p.work_ethic in work_options else 1)
+                family = st.selectbox("Сімейні цінності:", family_options,
+                                       index=family_options.index(p.family_values) if p.family_values in family_options else 1)
 
             st.markdown("#### 💭 Емоційні патерни")
             col5, col6, col7 = st.columns(3)
             with col5:
-                stress = st.selectbox("Реакція на стрес:", ["analytical", "emotional", "avoidant"], index=0)
+                stress = st.selectbox("Реакція на стрес:", stress_options,
+                                       index=stress_options.index(p.stress_reaction) if p.stress_reaction in stress_options else 0)
             with col6:
-                joy = st.selectbox("Вираження радості:", ["enthusiastic", "calm", "reserved"], index=0)
+                joy = st.selectbox("Вираження радості:", joy_options,
+                                    index=joy_options.index(p.joy_expression) if p.joy_expression in joy_options else 0)
             with col7:
-                criticism = st.selectbox("Реакція на критику:", ["defensive", "accepting", "dismissive"], index=1)
+                criticism = st.selectbox("Реакція на критику:", criticism_options,
+                                          index=criticism_options.index(p.criticism_response) if p.criticism_response in criticism_options else 1)
 
             submitted = st.form_submit_button("💾 Зберегти особистість", use_container_width=True)
 
         if submitted:
             personality = PersonalityConfig(
                 vocabulary_style=vocab_style,
-                favorite_phrases=[p.strip() for p in fav_phrases.split(",") if p.strip()],
+                favorite_phrases=[ph.strip() for ph in fav_phrases.split(",") if ph.strip()],
                 speech_formality=formality, humor_level=humor,
                 political_stance=political, religious_views=religious,
                 work_ethic=work_ethic, family_values=family,
                 stress_reaction=stress, joy_expression=joy, criticism_response=criticism,
                 common_words=[w.strip() for w in common_words.split(",") if w.strip()],
-                slang_terms=[], bio=bio,
+                slang_terms=p.slang_terms, bio=bio,
             )
             twin.initialize_personality(personality)
             st.success("✅ Особистість оновлено!")
             st.balloons()
+            st.rerun()
 
         if twin.cognitive_engine:
             st.markdown("---")
@@ -642,16 +837,19 @@ else:
     # ========================================
     elif st.session_state.current_tab == "🔒 Безпека":
         st.markdown("### 🔒 Безпека та контроль")
-        sec_tabs = st.tabs(["🔐 Доступ", "🛡️ Шифрування", "📜 Спадщина", "📤 Експорт"])
+        sec_tabs = st.tabs(["🔐 Доступ", "🔑 Пароль", "🛡️ Шифрування", "📜 Спадщина", "📋 Аудит", "📤 Експорт і бекап"])
 
         with sec_tabs[0]:
             st.markdown("#### Поточний статус безпеки")
             status = twin.get_status()
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Авторизовано", "Так" if status["security"]["authenticated"] else "Ні")
             with col2:
                 st.metric("Користувач", status["security"].get("user", "невідомо"))
+            with col3:
+                seconds_left = twin.access_control.session_seconds_left()
+                st.metric("Сесія спливає через", f"{seconds_left // 60} хв" if seconds_left else "—")
 
             st.markdown("---")
             st.markdown("#### Рівні доступу")
@@ -665,7 +863,29 @@ else:
                     st.write(" | ".join(perms))
 
         with sec_tabs[1]:
-            st.markdown("#### 🔐 Шифрування даних")
+            st.markdown("#### 🔑 Зміна пароля")
+            has_pwd = twin.access_control.has_password()
+            st.caption("Пароль ще не встановлено — можна задати новий без підтвердження старого."
+                       if not has_pwd else "Введіть поточний пароль, щоб встановити новий.")
+            with st.form("change_password_form"):
+                old_pwd = st.text_input("Поточний пароль:", type="password", disabled=not has_pwd)
+                new_pwd = st.text_input("Новий пароль:", type="password")
+                new_pwd_confirm = st.text_input("Повторіть новий пароль:", type="password")
+                pwd_submitted = st.form_submit_button("💾 Змінити пароль", use_container_width=True)
+            if pwd_submitted:
+                if not new_pwd:
+                    st.warning("Введіть новий пароль")
+                elif new_pwd != new_pwd_confirm:
+                    st.error("Паролі не збігаються")
+                else:
+                    ok = twin.change_password(new_pwd, old_pwd)
+                    if ok:
+                        st.success("✅ Пароль змінено")
+                    else:
+                        st.error("❌ Неправильний поточний пароль")
+
+        with sec_tabs[2]:
+            st.markdown("#### 🛡️ Шифрування даних")
             text_to_encrypt = st.text_area("Текст для шифрування:", placeholder="Введіть секретне повідомлення...")
             col1, col2 = st.columns(2)
             with col1:
@@ -689,7 +909,7 @@ else:
                     else:
                         st.warning("Спочатку зашифруйте щось")
 
-        with sec_tabs[2]:
+        with sec_tabs[3]:
             st.markdown("#### 📜 Протокол спадщини")
             st.info("**Що станеться з вашим двійником у разі вашої відсутності?**")
             legacy_mode = st.selectbox("Режим спадщини:", list(LegacyProtocol.INHERITANCE_MODES.keys()),
@@ -708,7 +928,28 @@ else:
             st.markdown("**Поточний режим:** `" + twin.legacy.mode + "`")
             st.markdown("**Активний:** `" + ("Так" if twin.legacy.is_active else "Ні") + "`")
 
-        with sec_tabs[3]:
+            st.markdown("---")
+            st.markdown("#### 🧪 Симуляція активації")
+            st.caption("Перевірте, що станеться, якщо умова активації (напр. неактивність) спрацює — без реального очікування.")
+            if st.button("▶️ Симулювати активацію протоколу зараз"):
+                twin.legacy.is_active = True
+                result = twin.legacy.execute(twin)
+                st.json(result)
+                twin.legacy.is_active = False  # скидаємо симуляцію, щоб не впливати на реальний стан
+                twin.save_legacy_config()
+
+        with sec_tabs[4]:
+            st.markdown("#### 📋 Журнал дій (аудит)")
+            st.caption("Останні дії з профілем: вхід, зміна пароля, редагування спогадів і особистості.")
+            log = twin.access_log(limit=100)
+            if log:
+                for entry in log:
+                    st.markdown(f"`{entry['timestamp'][:19]}` — **{entry['action']}**" +
+                                (f" _{entry['detail']}_" if entry.get("detail") else ""))
+            else:
+                st.info("Журнал ще порожній.")
+
+        with sec_tabs[5]:
             st.markdown("#### 📤 Експорт даних")
             export_level = st.selectbox("Рівень доступу для експорту:",
                                          [SecurityLevel.PUBLIC, SecurityLevel.FAMILY, SecurityLevel.PRIVATE, SecurityLevel.CRITICAL],
@@ -725,6 +966,17 @@ else:
                         st.json(data)
                 except Exception as e:
                     st.error("❌ Помилка: " + str(e))
+
+            st.markdown("---")
+            st.markdown("#### 💽 Повний бекап бази даних")
+            st.caption("Завантажте всю SQLite-базу (усі профілі, спогади, розмови) як єдиний файл для резервного копіювання.")
+            backup = twin.backup_bytes()
+            if backup:
+                st.download_button("⬇️ Завантажити .db бекап", data=backup,
+                                    file_name="digital_twin_backup_" + datetime.now().strftime('%Y%m%d_%H%M%S') + ".db",
+                                    mime="application/octet-stream")
+            else:
+                st.info("Бекап недоступний (персистентність вимкнена).")
 
     # ========================================
     # TAB: ANALYTICS
@@ -791,6 +1043,35 @@ else:
             st.info("Немає даних.")
 
         st.markdown("---")
+        col_mood, col_hour = st.columns(2)
+
+        with col_mood:
+            st.markdown("#### 📉 Динаміка настрою в часі")
+            st.caption("Числове значення настрою (від −1 негативний до +1 позитивний) за кожну репліку.")
+            valence = analytics.emotion_valence_timeline(emotions)
+            if valence:
+                st.line_chart(valence)
+            else:
+                st.info("Ще немає даних для побудови динаміки настрою.")
+
+        with col_hour:
+            st.markdown("#### 🕐 Активність за годинами доби")
+            hourly = analytics.activity_by_hour(conversation)
+            if any(hourly.values()):
+                st.bar_chart(hourly)
+            else:
+                st.info("Ще немає історії розмов для цієї діаграми.")
+
+        st.markdown("---")
+        st.markdown("#### ✍️ Довжина повідомлень")
+        len_stats = analytics.message_length_stats(conversation)
+        len_col1, len_col2 = st.columns(2)
+        with len_col1:
+            st.markdown("<div class='stat-card'><div class='stat-number'>" + str(len_stats["avg_user_words"]) + "</div><div class='stat-label'>Слів у повідомленні (Ви)</div></div>", unsafe_allow_html=True)
+        with len_col2:
+            st.markdown("<div class='stat-card'><div class='stat-number'>" + str(len_stats["avg_twin_words"]) + "</div><div class='stat-label'>Слів у відповіді (Двійник)</div></div>", unsafe_allow_html=True)
+
+        st.markdown("---")
         st.markdown("#### 💬 Історія розмов (останні 10)")
         if conversation:
             for turn in conversation[-10:]:
@@ -799,6 +1080,34 @@ else:
                 st.markdown(f"{mode_icon} **TWIN**: {turn['twin'][:100]}")
         else:
             st.info("Історія чату порожня")
+
+        st.markdown("---")
+        st.markdown("#### 📄 Звіт")
+        report_lines = [
+            f"# Аналітичний звіт — {twin.profile_name}",
+            f"Дата формування: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            "",
+            "## Загальна статистика",
+            f"- Спогадів: {stats['memories_count']}",
+            f"- Взаємодій: {stats['interactions_count']}",
+            f"- Домінантна емоція: {stats['dominant_emotion']}",
+            f"- Відповідей від LLM: {stats['llm_usage_pct']}%",
+            f"- Середня довжина повідомлення (Ви): {len_stats['avg_user_words']} слів",
+            f"- Середня довжина відповіді (Двійник): {len_stats['avg_twin_words']} слів",
+            "",
+            "## Розподіл емоцій",
+            *([f"- {e}: {c}" for e, c in emo_dist.items()] if emo_dist else ["Немає даних"]),
+            "",
+            "## Джерела спогадів",
+            *([f"- {s}: {c}" for s, c in sources.items()] if sources else ["Немає даних"]),
+            "",
+            "## Найчастотніші слова",
+            *([f"- {w['word']}: {w['count']}" for w in words] if words else ["Немає даних"]),
+        ]
+        report_md = "\n".join(report_lines)
+        st.download_button("⬇️ Завантажити звіт (Markdown)", data=report_md,
+                            file_name=f"analytics_report_{twin.profile_id}_{datetime.now().strftime('%Y%m%d')}.md",
+                            mime="text/markdown")
 
 
 # ============================================================================
