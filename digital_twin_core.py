@@ -97,6 +97,7 @@ class EncryptionManager:
 class AccessControl:
     def __init__(self):
         self._authenticated_user: Optional[str] = None
+        self._authenticated_username: Optional[str] = None
         self._permissions: Dict[str, List[str]] = {
             "owner": ["read", "write", "delete", "configure", "talk"],
             "family": ["read", "talk"],
@@ -105,9 +106,43 @@ class AccessControl:
         self._session_expiry: Optional[datetime] = None
         self._biometric_profile: Optional[BiometricProfile] = None
         self._password_hash: Optional[str] = None
+        # Таблиця іменованих облікових записів для рольового входу
+        # (username -> {"password_hash":.., "role":..}), окрім єдиного
+        # "власницького" пароля вище (used для звичайного profile switch).
+        self._users: Dict[str, Dict[str, str]] = {}
 
     def register_biometrics(self, profile: BiometricProfile):
         self._biometric_profile = profile
+
+    def add_user(self, username: str, password: str, role: str):
+        """Реєструє іменований обліковий запис для входу за роллю."""
+        if role not in self._permissions:
+            raise ValueError(f"Невідома роль: {role}")
+        self._users[username] = {
+            "password_hash": hashlib.sha256(password.encode()).hexdigest(),
+            "role": role,
+        }
+
+    def login(self, username: str, password: str) -> Optional[str]:
+        """Вхід за логіном+паролем із таблиці іменованих користувачів.
+        Повертає роль при успіху, або None при невірних даних."""
+        user = self._users.get(username)
+        if not user:
+            return None
+        candidate_hash = hashlib.sha256(password.encode()).hexdigest()
+        if not secrets.compare_digest(candidate_hash, user["password_hash"]):
+            return None
+        self._authenticated_user = user["role"]
+        self._authenticated_username = username
+        self._session_expiry = datetime.now() + timedelta(hours=1)
+        return user["role"]
+
+    def current_username(self) -> Optional[str]:
+        return self._authenticated_username
+
+    def list_users(self) -> List[Dict]:
+        """Список зареєстрованих іменованих облікових записів (без паролів)."""
+        return [{"username": u, "role": info["role"]} for u, info in self._users.items()]
 
     def set_password(self, password: str):
         self._password_hash = hashlib.sha256(password.encode()).hexdigest()
@@ -1611,6 +1646,38 @@ class Orchestrator:
             if self.autosave:
                 self._log("change_password")
         return ok
+
+    # ---- Рольовий вхід за іменованими обліковими записами ----
+    DEMO_ACCOUNTS = [
+        ("owner", "owner2026", "owner", "👑 Власник"),
+        ("family", "family2026", "family", "👨‍👩‍👧 Родина"),
+        ("guest", "guest2026", "guest", "🚶 Гість"),
+    ]
+
+    def add_user(self, username: str, password: str, role: str):
+        """Реєструє іменований обліковий запис із заданою роллю доступу."""
+        self.access_control.add_user(username, password, role)
+        self._log("add_user", f"{username}:{role}")
+
+    def login_as(self, username: str, password: str) -> Optional[str]:
+        """Вхід за логіном+паролем. Повертає роль при успіху, або None."""
+        role = self.access_control.login(username, password)
+        if role:
+            self._log("login_as", f"{username}:{role}")
+        return role
+
+    def list_users(self) -> List[Dict]:
+        return self.access_control.list_users()
+
+    def current_username(self) -> Optional[str]:
+        return self.access_control.current_username()
+
+    def setup_demo_accounts(self):
+        """Створює 3 тестові облікові записи (Власник/Родина/Гість) для демонстрації
+        розмежування доступу за ролями — за зразком тестових акаунтів диспетчерських систем."""
+        for username, password, role, _label in self.DEMO_ACCOUNTS:
+            self.add_user(username, password, role)
+        self._log("setup_demo_accounts")
 
     # ---- Основний цикл спілкування ----
     def process_message(self, user_input: str, user_id: str = "default") -> Dict:
