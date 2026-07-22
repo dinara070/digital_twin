@@ -1579,7 +1579,7 @@ class Orchestrator:
             self.cognitive_engine.llm_provider = self.llm_provider
         if self.autosave and self.db:
             encrypted = self.encryption.encrypt(api_key, context=f"llm_key:{self.profile_id}")
-            self.db.save_encrypted_secret(self.profile_id, encrypted)
+            self._db_call("save_encrypted_secret", self.profile_id, encrypted)
             self._log("configure_llm", model)
 
     def llm_status(self) -> Dict:
@@ -1722,7 +1722,7 @@ class Orchestrator:
         if self.autosave:
             new_records = [r for r in self.vector_db.export_records() if r["id"] not in before_ids]
             if new_records:
-                self.db.bulk_save_memories(self.profile_id, new_records)
+                self._db_call("bulk_save_memories", self.profile_id, new_records)
 
     def enable_continuous_learning(self, sources: List[str]):
         self.continuous_learning.start()
@@ -1732,7 +1732,8 @@ class Orchestrator:
             if self.autosave:
                 records = self.vector_db.export_records()
                 if records:
-                    self.db.save_memory(
+                    self._db_call(
+                        "save_memory",
                         self.profile_id, records[-1]["id"], records[-1]["text"],
                         records[-1]["vector"], records[-1]["metadata"],
                     )
@@ -1744,7 +1745,7 @@ class Orchestrator:
             raise PermissionError("Немає дозволу на видалення")
         self.vector_db.delete_memory(memory_id)
         if self.autosave:
-            self.db.delete_memory(self.profile_id, memory_id)
+            self._db_call("delete_memory", self.profile_id, memory_id)
             self._log("delete_memory", memory_id)
 
     def update_memory(self, memory_id: str, new_text: str):
@@ -1752,7 +1753,7 @@ class Orchestrator:
             raise PermissionError("Немає дозволу на запис")
         new_vector = self.vector_db.update_memory(memory_id, new_text)
         if new_vector is not None and self.autosave:
-            self.db.update_memory_text(self.profile_id, memory_id, new_text, new_vector)
+            self._db_call("update_memory_text", self.profile_id, memory_id, new_text, new_vector)
             self._log("update_memory", memory_id)
 
     def update_memory_metadata(self, memory_id: str, patch: Dict) -> bool:
@@ -1763,7 +1764,7 @@ class Orchestrator:
         if found and self.autosave:
             record = next((r for r in self.vector_db.export_records() if r["id"] == memory_id), None)
             if record:
-                self.db.save_memory(self.profile_id, record["id"], record["text"], record["vector"], record["metadata"])
+                self._db_call("save_memory", self.profile_id, record["id"], record["text"], record["vector"], record["metadata"])
                 self._log("update_memory_metadata", memory_id)
         return found
 
@@ -1793,7 +1794,7 @@ class Orchestrator:
         if self.autosave:
             record = next((r for r in self.vector_db.export_records() if r["id"] == memory_id), None)
             if record:
-                self.db.save_memory(self.profile_id, record["id"], record["text"], record["vector"], record["metadata"])
+                self._db_call("save_memory", self.profile_id, record["id"], record["text"], record["vector"], record["metadata"])
                 self._log("save_text_as_memory", memory_id)
         return memory_id
 
@@ -1801,17 +1802,17 @@ class Orchestrator:
     def save_personality_preset(self, name: str) -> Optional[int]:
         if not self.autosave:
             return None
-        preset_id = self.db.save_personality_preset(self.profile_id, name, self._personality_to_dict(self.personality))
+        preset_id = self._db_call("save_personality_preset", self.profile_id, name, self._personality_to_dict(self.personality))
         self._log("save_preset", name)
         return preset_id
 
     def list_personality_presets(self) -> List[Dict]:
-        return self.db.list_personality_presets(self.profile_id) if self.db else []
+        return self._db_call("list_personality_presets", self.profile_id, default=[])
 
     def apply_personality_preset(self, preset_id: int) -> bool:
         if not self.db:
             return False
-        data = self.db.load_personality_preset(preset_id)
+        data = self._db_call("load_personality_preset", preset_id)
         if not data:
             return False
         self.initialize_personality(PersonalityConfig(**data))
@@ -1820,7 +1821,7 @@ class Orchestrator:
 
     def delete_personality_preset(self, preset_id: int):
         if self.db:
-            self.db.delete_personality_preset(preset_id)
+            self._db_call("delete_personality_preset", preset_id)
 
     # ---- Керування історією розмов ----
     def clear_conversation(self):
@@ -1830,7 +1831,7 @@ class Orchestrator:
             self.cognitive_engine.emotional_state.current_emotion = "neutral"
         self.state["total_interactions"] = 0
         if self.autosave:
-            self.db.clear_conversation(self.profile_id)
+            self._db_call("clear_conversation", self.profile_id)
             self._log("clear_conversation")
 
     def pop_last_turn(self) -> Optional[str]:
@@ -1842,16 +1843,16 @@ class Orchestrator:
             self.cognitive_engine.emotional_state.emotion_history.pop()
         self.state["total_interactions"] = max(0, self.state["total_interactions"] - 1)
         if self.autosave:
-            self.db.delete_last_conversation_turn(self.profile_id)
+            self._db_call("delete_last_conversation_turn", self.profile_id)
         return last["user"]
 
     # ---- Аудит ----
     def access_log(self, limit: int = 100) -> List[Dict]:
-        return self.db.load_access_log(self.profile_id, limit) if self.db else []
+        return self._db_call("load_access_log", self.profile_id, limit, default=[])
 
     # ---- Резервне копіювання ----
     def backup_bytes(self) -> Optional[bytes]:
-        return self.db.raw_backup_bytes() if self.db else None
+        return self._db_call("raw_backup_bytes", default=None)
 
     # ---- Експорт / Імпорт ----
     def export_data(self, security_level: SecurityLevel) -> Dict:
@@ -1899,7 +1900,7 @@ class Orchestrator:
         if self.autosave:
             records = self.vector_db.export_records()
             if records:
-                self.db.bulk_save_memories(self.profile_id, records)
+                self._db_call("bulk_save_memories", self.profile_id, records)
 
     def _check_security_level(self, memory: Dict, level: SecurityLevel) -> bool:
         meta = memory.get("metadata", {})
@@ -1921,7 +1922,7 @@ class Orchestrator:
         self.cognitive_engine = None
         self.state = {"status": "purged", "timestamp": datetime.now().isoformat()}
         if self.autosave:
-            self.db.delete_profile(self.profile_id)
+            self._db_call("delete_profile", self.profile_id)
 
     # ---- Персистентність профілю ----
     def load_from_db(self):
@@ -1974,7 +1975,8 @@ class Orchestrator:
 
     def save_legacy_config(self):
         if self.autosave:
-            self.db.save_legacy(
+            self._db_call(
+                "save_legacy",
                 self.profile_id, self.legacy.mode, self.legacy.beneficiaries,
                 self.legacy.inactivity_days, self.legacy.is_active,
             )
