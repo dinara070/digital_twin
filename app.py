@@ -126,6 +126,22 @@ def get_emotion_emoji(emotion: str) -> str:
     return mapping.get(emotion, "😐")
 
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def permission_guarded():
+    """Перехоплює PermissionError від дій, недоступних для поточної ролі
+    (напр. «гість» чи «родина» намагається редагувати/видаляти дані),
+    і показує зрозуміле повідомлення замість падіння всього застосунку."""
+    try:
+        yield
+    except PermissionError as e:
+        current = st.session_state.twin.current_username() if st.session_state.twin else None
+        role_note = f" (поточний користувач: {current})" if current else ""
+        st.error(f"⛔ {e}{role_note}")
+
+
 def create_demo_twin(profile_id: str = None) -> Orchestrator:
     twin = Orchestrator(
         profile_id=profile_id or "demo-" + str(uuid.uuid4())[:8],
@@ -372,6 +388,14 @@ with st.sidebar:
                 else:
                     st.warning("Введіть ключ")
 
+        st.markdown("---")
+        role_labels = {"owner": "👑 Власник", "family": "👨‍👩‍👧 Родина", "guest": "🚶 Гість"}
+        current_role = twin.get_status()["security"].get("user")
+        if twin.current_username():
+            st.caption(f"🔑 Увійшли як **{twin.current_username()}** — {role_labels.get(current_role, current_role)}")
+        else:
+            st.caption("🔑 Ролі доступу (Власник / Родина / Гість) — розділ 🔒 Безпека → 🔐 Доступ")
+
     st.markdown("---")
     st.markdown("## 📍 Навігація")
     tab = st.radio(
@@ -473,8 +497,9 @@ else:
                 st.caption(caption)
             with btn_col:
                 if msg_key and st.button("💾", key="pin_" + msg_key, help="Зберегти цю репліку як спогад"):
-                    twin.save_text_as_memory(content, source="chat")
-                    st.toast("Збережено як спогад!")
+                    with permission_guarded():
+                        twin.save_text_as_memory(content, source="chat")
+                        st.toast("Збережено як спогад!")
 
         # Історія розмови (з опційним фільтром пошуку)
         visible_history = st.session_state.chat_history
@@ -587,20 +612,23 @@ else:
                         with col_pin:
                             pin_label = "📌 Відкріпити" if mem.get("metadata", {}).get("pinned") else "⭐ Закріпити"
                             if st.button(pin_label, key="pin_mem_" + mem["id"], use_container_width=True):
-                                twin.toggle_memory_pin(mem["id"])
-                                st.rerun()
+                                with permission_guarded():
+                                    twin.toggle_memory_pin(mem["id"])
+                                    st.rerun()
                         with col_save:
                             if st.button("💾 Зберегти зміни", key="save_" + mem["id"], use_container_width=True):
-                                if new_text != mem["text"]:
-                                    twin.update_memory(mem["id"], new_text)
-                                tag_list = [t.strip() for t in new_tags.split(",") if t.strip()]
-                                twin.update_memory_metadata(mem["id"], {"tags": tag_list, "security": new_sec})
-                                st.success("Оновлено!")
-                                st.rerun()
+                                with permission_guarded():
+                                    if new_text != mem["text"]:
+                                        twin.update_memory(mem["id"], new_text)
+                                    tag_list = [t.strip() for t in new_tags.split(",") if t.strip()]
+                                    twin.update_memory_metadata(mem["id"], {"tags": tag_list, "security": new_sec})
+                                    st.success("Оновлено!")
+                                    st.rerun()
                         with col_del:
                             if st.button("🗑️ Видалити", key="del_" + mem["id"], use_container_width=True):
-                                twin.delete_memory(mem["id"])
-                                st.rerun()
+                                with permission_guarded():
+                                    twin.delete_memory(mem["id"])
+                                    st.rerun()
             else:
                 st.info("Спогадів ще немає. Імпортуйте дані у вкладці 'Імпорт'.")
 
@@ -617,8 +645,9 @@ else:
                     if mem.get("metadata", {}).get("tags"):
                         st.caption("Теги: " + ", ".join(mem["metadata"]["tags"]))
                     if st.button("📌 Відкріпити", key="unpin_" + mem["id"]):
-                        twin.toggle_memory_pin(mem["id"])
-                        st.rerun()
+                        with permission_guarded():
+                            twin.toggle_memory_pin(mem["id"])
+                            st.rerun()
                     st.markdown("---")
             else:
                 st.info("Ще немає закріплених спогадів — натисніть ⭐ біля будь-якого запису у вкладці «Перегляд».")
@@ -678,9 +707,10 @@ else:
                                                             SecurityLevel.PRIVATE, SecurityLevel.CRITICAL],
                                   format_func=lambda x: x.value.upper())
             if st.button("📥 Завантажити повний стан (JSON)"):
-                data = twin.export_data(level)
-                st.download_button("⬇️ Зберегти файл", data=json.dumps(data, indent=2, ensure_ascii=False, default=str),
-                                    file_name=f"twin_state_{twin.profile_id}.json", mime="application/json")
+                with permission_guarded():
+                    data = twin.export_data(level)
+                    st.download_button("⬇️ Зберегти файл", data=json.dumps(data, indent=2, ensure_ascii=False, default=str),
+                                        file_name=f"twin_state_{twin.profile_id}.json", mime="application/json")
 
             uploaded = st.file_uploader("Імпортувати стан з JSON:", type=["json"])
             if uploaded and st.button("📤 Застосувати імпорт"):
@@ -846,10 +876,53 @@ else:
             with col1:
                 st.metric("Авторизовано", "Так" if status["security"]["authenticated"] else "Ні")
             with col2:
-                st.metric("Користувач", status["security"].get("user", "невідомо"))
+                current_user_label = twin.current_username() or status["security"].get("user", "невідомо")
+                st.metric("Користувач", current_user_label)
             with col3:
                 seconds_left = twin.access_control.session_seconds_left()
                 st.metric("Сесія спливає через", f"{seconds_left // 60} хв" if seconds_left else "—")
+
+            st.markdown("---")
+            st.markdown("#### 🔑 Вхід під роллю (Власник / Родина / Гість)")
+            st.caption("Перевірте, як виглядає доступ до двійника з точки зору різних ролей — "
+                       "власника, члена родини чи гостя.")
+
+            registered_users = twin.list_users()
+            if not registered_users:
+                st.info("Тестові облікові записи ще не створені для цього профілю.")
+                if st.button("⚙️ Створити тестові облікові записи", use_container_width=True):
+                    twin.setup_demo_accounts()
+                    st.success("Створено 3 тестові облікові записи!")
+                    st.rerun()
+            else:
+                login_col1, login_col2 = st.columns(2)
+                with login_col1:
+                    role_username = st.text_input("Логін користувача:", key="role_login_username",
+                                                    placeholder="Введіть логін...")
+                with login_col2:
+                    show_pwd = st.checkbox("👁 Показати пароль", key="role_login_show_pwd")
+                    role_password = st.text_input("Пароль:", key="role_login_password",
+                                                    type="default" if show_pwd else "password",
+                                                    placeholder="Введіть пароль...")
+
+                if st.button("▶️ Увійти під роллю", use_container_width=True, type="primary"):
+                    role = twin.login_as(role_username, role_password)
+                    if role:
+                        role_labels = {"owner": "👑 Власник", "family": "👨‍👩‍👧 Родина", "guest": "🚶 Гість"}
+                        st.success(f"Успішний вхід як «{role_username}» — роль: {role_labels.get(role, role)}")
+                        st.rerun()
+                    else:
+                        st.error("Невірний логін або пароль")
+
+                with st.expander("ℹ️ Тестові облікові записи (для демо)"):
+                    demo_rows = "\n".join(
+                        f"| `{u}` | `{p}` | {label} |" for u, p, _r, label in twin.DEMO_ACCOUNTS
+                    )
+                    st.markdown(
+                        "| Логін | Пароль | Роль |\n|---|---|---|\n" + demo_rows
+                    )
+                    st.caption("Система розмежування доступу за ролями. Власник має повний доступ, "
+                               "родина може читати й спілкуватися, гість — лише спілкуватися.")
 
             st.markdown("---")
             st.markdown("#### Рівні доступу")
@@ -932,11 +1005,12 @@ else:
             st.markdown("#### 🧪 Симуляція активації")
             st.caption("Перевірте, що станеться, якщо умова активації (напр. неактивність) спрацює — без реального очікування.")
             if st.button("▶️ Симулювати активацію протоколу зараз"):
-                twin.legacy.is_active = True
-                result = twin.legacy.execute(twin)
-                st.json(result)
-                twin.legacy.is_active = False  # скидаємо симуляцію, щоб не впливати на реальний стан
-                twin.save_legacy_config()
+                with permission_guarded():
+                    twin.legacy.is_active = True
+                    result = twin.legacy.execute(twin)
+                    st.json(result)
+                    twin.legacy.is_active = False  # скидаємо симуляцію, щоб не впливати на реальний стан
+                    twin.save_legacy_config()
 
         with sec_tabs[4]:
             st.markdown("#### 📋 Журнал дій (аудит)")
