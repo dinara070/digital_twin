@@ -112,6 +112,23 @@ class AccessControl:
     def set_password(self, password: str):
         self._password_hash = hashlib.sha256(password.encode()).hexdigest()
 
+    def has_password(self) -> bool:
+        return self._password_hash is not None
+
+    def change_password(self, old_password: str, new_password: str) -> bool:
+        """Зміна пароля. Якщо пароль ще не встановлено — стара перевірка не потрібна."""
+        if self._password_hash is not None:
+            old_hash = hashlib.sha256(old_password.encode()).hexdigest()
+            if not secrets.compare_digest(old_hash, self._password_hash):
+                return False
+        self.set_password(new_password)
+        return True
+
+    def session_seconds_left(self) -> int:
+        if not self._authenticated_user or not self._session_expiry:
+            return 0
+        return max(0, int((self._session_expiry - datetime.now()).total_seconds()))
+
     def authenticate(self, method: str, credentials: Any) -> bool:
         if method == "biometric" and self._biometric_profile:
             verified = self._biometric_profile.verify_voice(credentials)
@@ -408,6 +425,30 @@ class VectorDatabase:
         self.text_store.pop(memory_id, None)
         return len(self.vectors) < before
 
+    def update_memory(self, memory_id: str, new_text: str) -> Optional[List[float]]:
+        """Оновлює текст спогаду та перераховує його вектор. Повертає новий вектор."""
+        if memory_id not in self.text_store:
+            return None
+        self.text_store[memory_id] = new_text
+        new_vector = self.embedder.embed(new_text)
+        self.vectors = [
+            (mid, new_vector if mid == memory_id else vec, meta)
+            for mid, vec, meta in self.vectors
+        ]
+        return new_vector
+
+    def update_metadata(self, memory_id: str, patch: Dict) -> bool:
+        """Часткове оновлення metadata (теги, pinned, security-рівень) без перерахунку вектора."""
+        found = False
+        new_vectors = []
+        for mid, vec, meta in self.vectors:
+            if mid == memory_id:
+                meta = {**meta, **patch}
+                found = True
+            new_vectors.append((mid, vec, meta))
+        self.vectors = new_vectors
+        return found
+
     # ---- Персистентність (серіалізація без ваг моделі) ----
     def export_records(self) -> List[Dict]:
         return [
@@ -564,6 +605,41 @@ class PersonalityConfig:
 - Часто вживані слова: {', '.join(self.common_words[:10]) if self.common_words else 'стандартні'}
 {"- Біографія: " + self.bio if self.bio else ""}
 """
+
+    def diff(self, other: "PersonalityConfig") -> Dict[str, Tuple[Any, Any]]:
+        """Порівнює дві конфігурації особистості, повертає лише поля, що відрізняються."""
+        from dataclasses import asdict
+        a, b = asdict(self), asdict(other)
+        return {k: (a[k], b[k]) for k in a if a[k] != b[k]}
+
+
+# Готові пресети особистості — швидкий старт без ручного налаштування кожного повзунка.
+PERSONALITY_PRESETS: Dict[str, Dict[str, Any]] = {
+    "Аналітик": dict(
+        vocabulary_style="formal", speech_formality=0.7, humor_level=0.2,
+        work_ethic="dedicated", stress_reaction="analytical",
+        joy_expression="calm", criticism_response="accepting",
+        common_words=["логічно", "дані", "структура", "аналіз"], slang_terms=[],
+    ),
+    "Комунікатор": dict(
+        vocabulary_style="casual", speech_formality=0.25, humor_level=0.75,
+        work_ethic="balanced", stress_reaction="emotional",
+        joy_expression="enthusiastic", criticism_response="accepting",
+        common_words=["класно", "давай", "чесно кажучи"], slang_terms=["короче", "типу"],
+    ),
+    "Творча особистість": dict(
+        vocabulary_style="poetic", speech_formality=0.35, humor_level=0.6,
+        work_ethic="relaxed", stress_reaction="avoidant",
+        joy_expression="enthusiastic", criticism_response="dismissive",
+        common_words=["натхнення", "ідея", "образ"], slang_terms=[],
+    ),
+    "Лідер": dict(
+        vocabulary_style="formal", speech_formality=0.6, humor_level=0.4,
+        work_ethic="dedicated", stress_reaction="analytical",
+        joy_expression="reserved", criticism_response="accepting",
+        common_words=["мета", "команда", "результат", "відповідальність"], slang_terms=[],
+    ),
+}
 
 
 class EmotionalState:
@@ -1115,6 +1191,26 @@ CREATE TABLE IF NOT EXISTS secrets_store (
     encrypted_api_key TEXT,
     FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS personality_presets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_presets_profile ON personality_presets(profile_id);
+
+CREATE TABLE IF NOT EXISTS access_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT,
+    timestamp TEXT NOT NULL,
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_access_log_profile ON access_log(profile_id);
 """
 
 
@@ -1303,6 +1399,80 @@ class TwinDatabase:
             ).fetchone()
             return row[0] if row else None
 
+    # ---- Пресети особистості ----
+    def save_personality_preset(self, profile_id: str, name: str, data: Dict) -> int:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO personality_presets (profile_id, name, data, created_at) VALUES (?, ?, ?, ?)",
+                (profile_id, name, json.dumps(data, ensure_ascii=False), datetime.now().isoformat()),
+            )
+            return cur.lastrowid
+
+    def list_personality_presets(self, profile_id: str) -> List[Dict]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, created_at FROM personality_presets WHERE profile_id = ? ORDER BY created_at DESC",
+                (profile_id,),
+            ).fetchall()
+            return [{"id": r[0], "name": r[1], "created_at": r[2]} for r in rows]
+
+    def load_personality_preset(self, preset_id: int) -> Optional[Dict]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT data FROM personality_presets WHERE id = ?", (preset_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def delete_personality_preset(self, preset_id: int):
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM personality_presets WHERE id = ?", (preset_id,))
+
+    # ---- Журнал доступу / аудит ----
+    def log_access(self, profile_id: str, action: str, detail: str = ""):
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO access_log (profile_id, action, detail, timestamp) VALUES (?, ?, ?, ?)",
+                (profile_id, action, detail, datetime.now().isoformat()),
+            )
+
+    def load_access_log(self, profile_id: str, limit: int = 100) -> List[Dict]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT action, detail, timestamp FROM access_log WHERE profile_id = ? ORDER BY id DESC LIMIT ?",
+                (profile_id, limit),
+            ).fetchall()
+            return [{"action": r[0], "detail": r[1], "timestamp": r[2]} for r in rows]
+
+    # ---- Керування історією розмов ----
+    def clear_conversation(self, profile_id: str):
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM conversation WHERE profile_id = ?", (profile_id,))
+            conn.execute("DELETE FROM emotion_history WHERE profile_id = ?", (profile_id,))
+
+    def delete_last_conversation_turn(self, profile_id: str):
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM conversation WHERE profile_id = ? ORDER BY id DESC LIMIT 1", (profile_id,)
+            ).fetchone()
+            if row:
+                conn.execute("DELETE FROM conversation WHERE id = ?", (row[0],))
+            row2 = conn.execute(
+                "SELECT id FROM emotion_history WHERE profile_id = ? ORDER BY id DESC LIMIT 1", (profile_id,)
+            ).fetchone()
+            if row2:
+                conn.execute("DELETE FROM emotion_history WHERE id = ?", (row2[0],))
+
+    def update_memory_text(self, profile_id: str, memory_id: str, new_text: str, new_vector: List[float]):
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE memories SET text = ?, vector = ? WHERE profile_id = ? AND id = ?",
+                (new_text, json.dumps(new_vector), profile_id, memory_id),
+            )
+
+    def raw_backup_bytes(self) -> bytes:
+        """Повертає сирі байти файлу SQLite для резервного копіювання."""
+        with self._lock:
+            with open(self.db_path, "rb") as f:
+                return f.read()
+
 # ============================================================================
 # MODULE: ORCHESTRATOR — Оркестратор — центральний модуль координації всіх компонентів двійника.
 # ============================================================================
@@ -1354,8 +1524,18 @@ class Orchestrator:
 
     # ---- Особистість / LLM ----
     def initialize_personality(self, config: PersonalityConfig):
+        # Зберігаємо історію розмови та емоційний стан поточного ядра (якщо є),
+        # щоб зміна особистості/застосування пресету не стирала активний чат.
+        old_history = self.cognitive_engine.conversation_history if self.cognitive_engine else []
+        old_emotion_history = self.cognitive_engine.emotional_state.emotion_history if self.cognitive_engine else []
+        old_current_emotion = self.cognitive_engine.emotional_state.current_emotion if self.cognitive_engine else "neutral"
+
         self.personality = config
         self.cognitive_engine = CognitiveEngine(self.vector_db, config, llm_provider=self.llm_provider)
+        self.cognitive_engine.conversation_history = old_history
+        self.cognitive_engine.emotional_state.emotion_history = old_emotion_history
+        self.cognitive_engine.emotional_state.current_emotion = old_current_emotion
+
         self.state["status"] = "personality_loaded"
         if self.autosave:
             self.db.save_personality(self.profile_id, self._personality_to_dict(config))
@@ -1367,6 +1547,7 @@ class Orchestrator:
         if self.autosave and self.db:
             encrypted = self.encryption.encrypt(api_key, context=f"llm_key:{self.profile_id}")
             self.db.save_encrypted_secret(self.profile_id, encrypted)
+            self.db.log_access(self.profile_id, "configure_llm", model)
 
     def llm_status(self) -> Dict:
         if not self.llm_provider:
@@ -1385,7 +1566,18 @@ class Orchestrator:
 
     # ---- Аутентифікація ----
     def authenticate(self, method: str, credentials: Any) -> bool:
-        return self.access_control.authenticate(method, credentials)
+        result = self.access_control.authenticate(method, credentials)
+        if result and self.autosave:
+            self.db.log_access(self.profile_id, "login", method)
+        return result
+
+    def change_password(self, new_password: str, old_password: str = "") -> bool:
+        ok = self.access_control.change_password(old_password, new_password)
+        if ok:
+            self.access_control.authenticate("password", new_password)
+            if self.autosave:
+                self.db.log_access(self.profile_id, "change_password")
+        return ok
 
     # ---- Основний цикл спілкування ----
     def process_message(self, user_input: str, user_id: str = "default") -> Dict:
@@ -1520,6 +1712,113 @@ class Orchestrator:
         self.vector_db.delete_memory(memory_id)
         if self.autosave:
             self.db.delete_memory(self.profile_id, memory_id)
+            self.db.log_access(self.profile_id, "delete_memory", memory_id)
+
+    def update_memory(self, memory_id: str, new_text: str):
+        if not self.access_control.check_permission("write"):
+            raise PermissionError("Немає дозволу на запис")
+        new_vector = self.vector_db.update_memory(memory_id, new_text)
+        if new_vector is not None and self.autosave:
+            self.db.update_memory_text(self.profile_id, memory_id, new_text, new_vector)
+            self.db.log_access(self.profile_id, "update_memory", memory_id)
+
+    def update_memory_metadata(self, memory_id: str, patch: Dict) -> bool:
+        """Часткове оновлення метаданих спогаду (pinned, tags, security-рівень тощо)."""
+        if not self.access_control.check_permission("write"):
+            raise PermissionError("Немає дозволу на запис")
+        found = self.vector_db.update_metadata(memory_id, patch)
+        if found and self.autosave:
+            record = next((r for r in self.vector_db.export_records() if r["id"] == memory_id), None)
+            if record:
+                self.db.save_memory(self.profile_id, record["id"], record["text"], record["vector"], record["metadata"])
+                self.db.log_access(self.profile_id, "update_memory_metadata", memory_id)
+        return found
+
+    def toggle_memory_pin(self, memory_id: str) -> bool:
+        memories = self.vector_db.get_all_memories()
+        mem = next((m for m in memories if m["id"] == memory_id), None)
+        new_pinned = not mem.get("metadata", {}).get("pinned", False) if mem else True
+        self.update_memory_metadata(memory_id, {"pinned": new_pinned})
+        return new_pinned
+
+    def apply_builtin_preset(self, preset_name: str) -> bool:
+        """Застосовує один із вбудованих швидких пресетів (PERSONALITY_PRESETS)."""
+        if preset_name not in PERSONALITY_PRESETS:
+            return False
+        current = self._personality_to_dict(self.personality)
+        current.update(PERSONALITY_PRESETS[preset_name])
+        self.initialize_personality(PersonalityConfig(**current))
+        if self.autosave:
+            self.db.log_access(self.profile_id, "apply_builtin_preset", preset_name)
+        return True
+
+    def save_text_as_memory(self, text: str, source: str = "chat") -> str:
+        """Швидке збереження довільного тексту (напр. репліки з чату) як нового спогаду."""
+        if not self.access_control.check_permission("write"):
+            raise PermissionError("Немає дозволу на запис")
+        memory_id = self.vector_db.add_memory(text, {"source": source})
+        if self.autosave:
+            record = next((r for r in self.vector_db.export_records() if r["id"] == memory_id), None)
+            if record:
+                self.db.save_memory(self.profile_id, record["id"], record["text"], record["vector"], record["metadata"])
+                self.db.log_access(self.profile_id, "save_text_as_memory", memory_id)
+        return memory_id
+
+    # ---- Пресети особистості ----
+    def save_personality_preset(self, name: str) -> Optional[int]:
+        if not self.autosave:
+            return None
+        preset_id = self.db.save_personality_preset(self.profile_id, name, self._personality_to_dict(self.personality))
+        self.db.log_access(self.profile_id, "save_preset", name)
+        return preset_id
+
+    def list_personality_presets(self) -> List[Dict]:
+        return self.db.list_personality_presets(self.profile_id) if self.db else []
+
+    def apply_personality_preset(self, preset_id: int) -> bool:
+        if not self.db:
+            return False
+        data = self.db.load_personality_preset(preset_id)
+        if not data:
+            return False
+        self.initialize_personality(PersonalityConfig(**data))
+        self.db.log_access(self.profile_id, "apply_preset", str(preset_id))
+        return True
+
+    def delete_personality_preset(self, preset_id: int):
+        if self.db:
+            self.db.delete_personality_preset(preset_id)
+
+    # ---- Керування історією розмов ----
+    def clear_conversation(self):
+        if self.cognitive_engine:
+            self.cognitive_engine.conversation_history = []
+            self.cognitive_engine.emotional_state.emotion_history = []
+            self.cognitive_engine.emotional_state.current_emotion = "neutral"
+        self.state["total_interactions"] = 0
+        if self.autosave:
+            self.db.clear_conversation(self.profile_id)
+            self.db.log_access(self.profile_id, "clear_conversation")
+
+    def pop_last_turn(self) -> Optional[str]:
+        """Видаляє останній хід розмови (для регенерації) і повертає текст користувача."""
+        if not self.cognitive_engine or not self.cognitive_engine.conversation_history:
+            return None
+        last = self.cognitive_engine.conversation_history.pop()
+        if self.cognitive_engine.emotional_state.emotion_history:
+            self.cognitive_engine.emotional_state.emotion_history.pop()
+        self.state["total_interactions"] = max(0, self.state["total_interactions"] - 1)
+        if self.autosave:
+            self.db.delete_last_conversation_turn(self.profile_id)
+        return last["user"]
+
+    # ---- Аудит ----
+    def access_log(self, limit: int = 100) -> List[Dict]:
+        return self.db.load_access_log(self.profile_id, limit) if self.db else []
+
+    # ---- Резервне копіювання ----
+    def backup_bytes(self) -> Optional[bytes]:
+        return self.db.raw_backup_bytes() if self.db else None
 
     # ---- Експорт / Імпорт ----
     def export_data(self, security_level: SecurityLevel) -> Dict:
@@ -1700,6 +1999,49 @@ def top_words(memories: List[Dict], top_n: int = 15, stopwords: set = None) -> L
 def response_mode_breakdown(conversation_history: List[Dict]) -> Dict[str, int]:
     """Скільки відповідей згенеровано через LLM vs шаблони."""
     return dict(Counter(turn.get("mode", "template") for turn in conversation_history))
+
+
+EMOTION_VALENCE = {
+    "happy": 1.0, "excited": 1.0, "nostalgic": 0.3, "thoughtful": 0.0,
+    "neutral": 0.0, "anxious": -0.5, "sad": -0.7, "angry": -1.0,
+}
+
+
+def emotion_valence_timeline(emotion_history: List[Dict]) -> Dict[str, float]:
+    """{timestamp: valence} — числовий ряд для графіка динаміки настрою в часі."""
+    timeline = sorted(emotion_history, key=lambda e: e["timestamp"])
+    return {
+        e["timestamp"][:19]: EMOTION_VALENCE.get(e["emotion"], 0.0) * e.get("intensity", 0.5)
+        for e in timeline
+    }
+
+
+def activity_by_hour(conversation_history: List[Dict]) -> Dict[str, int]:
+    """Розподіл кількості повідомлень за годиною доби (00-23)."""
+    counts = {f"{h:02d}": 0 for h in range(24)}
+    for turn in conversation_history:
+        ts = turn.get("timestamp", "")
+        if len(ts) >= 13 and "T" in ts:
+            hour = ts.split("T")[1][:2]
+            if hour in counts:
+                counts[hour] += 1
+    return counts
+
+
+def message_length_stats(conversation_history: List[Dict]) -> Dict[str, float]:
+    """Середня довжина повідомлень користувача та двійника (у словах)."""
+    if not conversation_history:
+        return {"avg_user_words": 0.0, "avg_twin_words": 0.0}
+    user_lens = [len(t.get("user", "").split()) for t in conversation_history]
+    twin_lens = [len(t.get("twin", "").split()) for t in conversation_history]
+    return {
+        "avg_user_words": round(sum(user_lens) / len(user_lens), 1),
+        "avg_twin_words": round(sum(twin_lens) / len(twin_lens), 1),
+    }
+
+
+def pinned_memories(memories: List[Dict]) -> List[Dict]:
+    return [m for m in memories if m.get("metadata", {}).get("pinned")]
 
 
 def summary_stats(status: Dict, memories: List[Dict], conversation_history: List[Dict],
