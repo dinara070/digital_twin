@@ -1520,7 +1520,40 @@ class Orchestrator:
         self._lock = threading.RLock()
 
         if self.db:
-            self.db.create_profile(self.profile_id, self.profile_name)
+            try:
+                self.db.create_profile(self.profile_id, self.profile_name)
+            except Exception:
+                pass  # захист від неповної/несумісної схеми БД при частковому деплої
+
+    def _log(self, action: str, detail: str = ""):
+        """Захищений виклик аудит-логу: ніколи не кидає виняток, навіть якщо
+        self.db застарілий/несумісний (напр. неповний деплой без методу
+        log_access). Втрата запису в лог не повинна ламати основну функцію."""
+        if not self.autosave or not self.db:
+            return
+        try:
+            self.db.log_access(self.profile_id, action, detail)
+        except Exception:
+            pass
+
+    def _db_call(self, method_name: str, *args, default=None, **kwargs):
+        """Універсальний захищений виклик self.db.<method_name>(...).
+
+        Якщо задеплоєна версія TwinDatabase застаріла/несумісна (не має
+        потрібного методу) або сам виклик впаде з будь-якої іншої причини,
+        повертає `default` замість падіння всього застосунку. Використовується
+        на «гарячому шляху» вхід → завантаження профілю → чат, щоб розбіжність
+        версій файлів під час деплою не блокувала роботу двійника повністю.
+        """
+        if not self.db:
+            return default
+        method = getattr(self.db, method_name, None)
+        if method is None:
+            return default
+        try:
+            return method(*args, **kwargs)
+        except Exception:
+            return default
 
     # ---- Особистість / LLM ----
     def initialize_personality(self, config: PersonalityConfig):
@@ -1538,7 +1571,7 @@ class Orchestrator:
 
         self.state["status"] = "personality_loaded"
         if self.autosave:
-            self.db.save_personality(self.profile_id, self._personality_to_dict(config))
+            self._db_call("save_personality", self.profile_id, self._personality_to_dict(config))
 
     def configure_llm(self, api_key: str, model: str = "claude-sonnet-5"):
         self.llm_provider = LLMProvider(api_key=api_key, model=model)
@@ -1547,7 +1580,7 @@ class Orchestrator:
         if self.autosave and self.db:
             encrypted = self.encryption.encrypt(api_key, context=f"llm_key:{self.profile_id}")
             self.db.save_encrypted_secret(self.profile_id, encrypted)
-            self.db.log_access(self.profile_id, "configure_llm", model)
+            self._log("configure_llm", model)
 
     def llm_status(self) -> Dict:
         if not self.llm_provider:
@@ -1568,7 +1601,7 @@ class Orchestrator:
     def authenticate(self, method: str, credentials: Any) -> bool:
         result = self.access_control.authenticate(method, credentials)
         if result and self.autosave:
-            self.db.log_access(self.profile_id, "login", method)
+            self._log("login", method)
         return result
 
     def change_password(self, new_password: str, old_password: str = "") -> bool:
@@ -1576,7 +1609,7 @@ class Orchestrator:
         if ok:
             self.access_control.authenticate("password", new_password)
             if self.autosave:
-                self.db.log_access(self.profile_id, "change_password")
+                self._log("change_password")
         return ok
 
     # ---- Основний цикл спілкування ----
@@ -1608,17 +1641,17 @@ class Orchestrator:
 
             last_turn = self.cognitive_engine.conversation_history[-1]
             if self.autosave:
-                self.db.append_conversation(
-                    self.profile_id, user_input, last_turn["twin"],
+                self._db_call(
+                    "append_conversation", self.profile_id, user_input, last_turn["twin"],
                     current_emotion, last_turn.get("mode", "template"),
                 )
-                self.db.append_emotion(
-                    self.profile_id, current_emotion,
+                self._db_call(
+                    "append_emotion", self.profile_id, current_emotion,
                     self.cognitive_engine.emotional_state.emotion_intensity,
                     (self.cognitive_engine.emotional_state.emotion_history[-1].get("trigger", "")
                      if self.cognitive_engine.emotional_state.emotion_history else ""),
                 )
-                self.db.touch_profile(self.profile_id)
+                self._db_call("touch_profile", self.profile_id)
 
             return {
                 "text": response_text,
@@ -1661,17 +1694,17 @@ class Orchestrator:
 
             last_turn = self.cognitive_engine.conversation_history[-1]
             if self.autosave:
-                self.db.append_conversation(
-                    self.profile_id, user_input, last_turn["twin"],
+                self._db_call(
+                    "append_conversation", self.profile_id, user_input, last_turn["twin"],
                     current_emotion, last_turn.get("mode", "template"),
                 )
-                self.db.append_emotion(
-                    self.profile_id, current_emotion,
+                self._db_call(
+                    "append_emotion", self.profile_id, current_emotion,
                     self.cognitive_engine.emotional_state.emotion_intensity,
                     (self.cognitive_engine.emotional_state.emotion_history[-1].get("trigger", "")
                      if self.cognitive_engine.emotional_state.emotion_history else ""),
                 )
-                self.db.touch_profile(self.profile_id)
+                self._db_call("touch_profile", self.profile_id)
 
     # ---- Пам'ять ----
     def import_memories(self, source_type: str, data: List[Dict]):
@@ -1712,7 +1745,7 @@ class Orchestrator:
         self.vector_db.delete_memory(memory_id)
         if self.autosave:
             self.db.delete_memory(self.profile_id, memory_id)
-            self.db.log_access(self.profile_id, "delete_memory", memory_id)
+            self._log("delete_memory", memory_id)
 
     def update_memory(self, memory_id: str, new_text: str):
         if not self.access_control.check_permission("write"):
@@ -1720,7 +1753,7 @@ class Orchestrator:
         new_vector = self.vector_db.update_memory(memory_id, new_text)
         if new_vector is not None and self.autosave:
             self.db.update_memory_text(self.profile_id, memory_id, new_text, new_vector)
-            self.db.log_access(self.profile_id, "update_memory", memory_id)
+            self._log("update_memory", memory_id)
 
     def update_memory_metadata(self, memory_id: str, patch: Dict) -> bool:
         """Часткове оновлення метаданих спогаду (pinned, tags, security-рівень тощо)."""
@@ -1731,7 +1764,7 @@ class Orchestrator:
             record = next((r for r in self.vector_db.export_records() if r["id"] == memory_id), None)
             if record:
                 self.db.save_memory(self.profile_id, record["id"], record["text"], record["vector"], record["metadata"])
-                self.db.log_access(self.profile_id, "update_memory_metadata", memory_id)
+                self._log("update_memory_metadata", memory_id)
         return found
 
     def toggle_memory_pin(self, memory_id: str) -> bool:
@@ -1749,7 +1782,7 @@ class Orchestrator:
         current.update(PERSONALITY_PRESETS[preset_name])
         self.initialize_personality(PersonalityConfig(**current))
         if self.autosave:
-            self.db.log_access(self.profile_id, "apply_builtin_preset", preset_name)
+            self._log("apply_builtin_preset", preset_name)
         return True
 
     def save_text_as_memory(self, text: str, source: str = "chat") -> str:
@@ -1761,7 +1794,7 @@ class Orchestrator:
             record = next((r for r in self.vector_db.export_records() if r["id"] == memory_id), None)
             if record:
                 self.db.save_memory(self.profile_id, record["id"], record["text"], record["vector"], record["metadata"])
-                self.db.log_access(self.profile_id, "save_text_as_memory", memory_id)
+                self._log("save_text_as_memory", memory_id)
         return memory_id
 
     # ---- Пресети особистості ----
@@ -1769,7 +1802,7 @@ class Orchestrator:
         if not self.autosave:
             return None
         preset_id = self.db.save_personality_preset(self.profile_id, name, self._personality_to_dict(self.personality))
-        self.db.log_access(self.profile_id, "save_preset", name)
+        self._log("save_preset", name)
         return preset_id
 
     def list_personality_presets(self) -> List[Dict]:
@@ -1782,7 +1815,7 @@ class Orchestrator:
         if not data:
             return False
         self.initialize_personality(PersonalityConfig(**data))
-        self.db.log_access(self.profile_id, "apply_preset", str(preset_id))
+        self._log("apply_preset", str(preset_id))
         return True
 
     def delete_personality_preset(self, preset_id: int):
@@ -1798,7 +1831,7 @@ class Orchestrator:
         self.state["total_interactions"] = 0
         if self.autosave:
             self.db.clear_conversation(self.profile_id)
-            self.db.log_access(self.profile_id, "clear_conversation")
+            self._log("clear_conversation")
 
     def pop_last_turn(self) -> Optional[str]:
         """Видаляє останній хід розмови (для регенерації) і повертає текст користувача."""
@@ -1892,35 +1925,43 @@ class Orchestrator:
 
     # ---- Персистентність профілю ----
     def load_from_db(self):
-        """Завантажує стан профілю з бази даних (якщо профіль уже існує)."""
+        """Завантажує стан профілю з бази даних (якщо профіль уже існує).
+
+        Кожен окремий читання обгорнуто в захищений виклик: якщо задеплоєна
+        версія TwinDatabase застаріла й не має якогось методу (розсинхрон
+        файлів під час деплою), профіль все одно завантажиться настільки
+        повно, наскільки це можливо, замість падіння всього застосунку.
+        """
         if not self.db:
             return False
 
-        personality_data = self.db.load_personality(self.profile_id)
+        personality_data = self._db_call("load_personality", self.profile_id)
         if personality_data:
             self.personality = PersonalityConfig(**personality_data)
             self.cognitive_engine = CognitiveEngine(self.vector_db, self.personality, llm_provider=self.llm_provider)
 
-        records = self.db.load_memories(self.profile_id)
+        records = self._db_call("load_memories", self.profile_id, default=[])
         if records:
             self.vector_db.load_records(records)
 
         if self.cognitive_engine:
-            self.cognitive_engine.conversation_history = self.db.load_conversation(self.profile_id)
+            self.cognitive_engine.conversation_history = self._db_call(
+                "load_conversation", self.profile_id, default=[])
+            raw_emotions = self._db_call("load_emotion_history", self.profile_id, default=[])
             self.cognitive_engine.emotional_state.emotion_history = [
                 {"emotion": e["emotion"], "intensity": e["intensity"], "trigger": e["trigger"], "timestamp": e["timestamp"]}
-                for e in self.db.load_emotion_history(self.profile_id)
+                for e in raw_emotions
             ]
             if self.cognitive_engine.emotional_state.emotion_history:
                 self.cognitive_engine.emotional_state.current_emotion = \
                     self.cognitive_engine.emotional_state.emotion_history[-1]["emotion"]
 
-        legacy_data = self.db.load_legacy(self.profile_id)
+        legacy_data = self._db_call("load_legacy", self.profile_id)
         if legacy_data:
             self.legacy.configure(legacy_data["mode"], legacy_data["beneficiaries"], legacy_data["inactivity_days"])
             self.legacy.is_active = legacy_data["is_active"]
 
-        encrypted_key = self.db.load_encrypted_secret(self.profile_id)
+        encrypted_key = self._db_call("load_encrypted_secret", self.profile_id)
         if encrypted_key and not self.llm_provider:
             try:
                 api_key = self.encryption.decrypt(encrypted_key, context=f"llm_key:{self.profile_id}")
