@@ -424,9 +424,30 @@ class VectorDatabase:
         memory_id = hashlib.sha256(f"{text}{time.time()}".encode()).hexdigest()[:16]
         self.text_store[memory_id] = text
         vector = self.embedder.embed(text)
-        self.vectors.append((memory_id, vector, metadata or {}))
+        meta = dict(metadata or {})
+        meta.setdefault("created_at", datetime.now().isoformat())
+        self.vectors.append((memory_id, vector, meta))
         self._maybe_refit()
         return memory_id
+
+    def find_near_duplicates(self, threshold: float = 0.93) -> List[Dict]:
+        """Знаходить пари спогадів із дуже схожим текстом (можливі дублікати).
+        O(n²) — прийнятно для типових обсягів персонального архіву спогадів."""
+        pairs = []
+        n = len(self.vectors)
+        for i in range(n):
+            id_a, vec_a, _ = self.vectors[i]
+            for j in range(i + 1, n):
+                id_b, vec_b, _ = self.vectors[j]
+                sim = self._cosine_similarity(vec_a, vec_b)
+                if sim >= threshold:
+                    pairs.append({
+                        "id_a": id_a, "text_a": self.text_store.get(id_a, ""),
+                        "id_b": id_b, "text_b": self.text_store.get(id_b, ""),
+                        "similarity": float(sim),
+                    })
+        pairs.sort(key=lambda p: p["similarity"], reverse=True)
+        return pairs
 
     def search(self, query: str, top_k: int = 5) -> List[Dict]:
         if not self.vectors:
@@ -675,6 +696,43 @@ PERSONALITY_PRESETS: Dict[str, Dict[str, Any]] = {
         common_words=["мета", "команда", "результат", "відповідальність"], slang_terms=[],
     ),
 }
+
+
+def infer_personality_from_bio(bio_text: str) -> Dict[str, Any]:
+    """Легка евристична підказка налаштувань особистості на основі вільного
+    тексту біографії — рахує ключові слова за категоріями та пропонує
+    орієнтовні значення повзунків. Це підказка для людини, а не точний
+    аналіз: результат варто розглядати як відправну точку, не істину.
+    """
+    text = bio_text.lower()
+
+    formal_markers = ["дослідж", "аналіз", "керівн", "менеджмент", "стратег", "структур", "офіційн"]
+    casual_markers = ["класно", "весело", "друз", "тусов", "чилити", "кайф"]
+    humor_markers = ["жарт", "гумор", "смішн", "весел", "прикол"]
+    serious_markers = ["відповідальн", "серйозн", "дисциплін", "точн", "ретельн"]
+    dedicated_markers = ["амбіці", "мета", "результат", "досягнен", "цілеспрям"]
+    relaxed_markers = ["баланс", "відпочи", "не поспіш", "спокійно"]
+    analytical_markers = ["аналіз", "логік", "систем", "структур", "алгоритм", "математ"]
+    emotional_markers = ["почутт", "емоц", "переживан", "хвилю"]
+
+    def score(markers):
+        return sum(text.count(m) for m in markers)
+
+    formal_score = score(formal_markers) - score(casual_markers)
+    humor_score = score(humor_markers) - score(serious_markers)
+    dedication_score = score(dedicated_markers) - score(relaxed_markers)
+    analytical_score = score(analytical_markers) - score(emotional_markers)
+
+    def clamp01(x):
+        return max(0.0, min(1.0, x))
+
+    suggestion = {
+        "speech_formality": clamp01(0.5 + formal_score * 0.08),
+        "humor_level": clamp01(0.5 + humor_score * 0.08),
+        "work_ethic": "dedicated" if dedication_score > 0 else ("relaxed" if dedication_score < -1 else "balanced"),
+        "stress_reaction": "analytical" if analytical_score >= 0 else "emotional",
+    }
+    return suggestion
 
 
 class EmotionalState:
@@ -1246,6 +1304,15 @@ CREATE TABLE IF NOT EXISTS access_log (
     FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_access_log_profile ON access_log(profile_id);
+
+CREATE TABLE IF NOT EXISTS personality_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_profile ON personality_snapshots(profile_id);
 """
 
 
@@ -1460,6 +1527,29 @@ class TwinDatabase:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM personality_presets WHERE id = ?", (preset_id,))
 
+    # ---- Історія версій особистості (snapshots) ----
+    def save_personality_snapshot(self, profile_id: str, data: Dict, limit: int = 30):
+        """Зберігає знімок особистості з міткою часу. Автоматично прибирає
+        найстаріші знімки понад ліміт, щоб таблиця не росла безмежно."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO personality_snapshots (profile_id, data, created_at) VALUES (?, ?, ?)",
+                (profile_id, json.dumps(data, ensure_ascii=False), datetime.now().isoformat()),
+            )
+            conn.execute(
+                "DELETE FROM personality_snapshots WHERE profile_id = ? AND id NOT IN "
+                "(SELECT id FROM personality_snapshots WHERE profile_id = ? ORDER BY id DESC LIMIT ?)",
+                (profile_id, profile_id, limit),
+            )
+
+    def load_personality_snapshots(self, profile_id: str) -> List[Dict]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, data, created_at FROM personality_snapshots WHERE profile_id = ? ORDER BY id DESC",
+                (profile_id,),
+            ).fetchall()
+            return [{"id": r[0], "data": json.loads(r[1]), "created_at": r[2]} for r in rows]
+
     # ---- Журнал доступу / аудит ----
     def log_access(self, profile_id: str, action: str, detail: str = ""):
         with self._lock, self._connect() as conn:
@@ -1607,6 +1697,7 @@ class Orchestrator:
         self.state["status"] = "personality_loaded"
         if self.autosave:
             self._db_call("save_personality", self.profile_id, self._personality_to_dict(config))
+            self._db_call("save_personality_snapshot", self.profile_id, self._personality_to_dict(config))
 
     def configure_llm(self, api_key: str, model: str = "claude-sonnet-5"):
         self.llm_provider = LLMProvider(api_key=api_key, model=model)
@@ -1815,6 +1906,19 @@ class Orchestrator:
             self._db_call("delete_memory", self.profile_id, memory_id)
             self._log("delete_memory", memory_id)
 
+    def bulk_delete_memories(self, memory_ids: List[str]):
+        if not self.access_control.check_permission("delete"):
+            raise PermissionError("Немає дозволу на видалення")
+        for mid in memory_ids:
+            self.vector_db.delete_memory(mid)
+            if self.autosave:
+                self._db_call("delete_memory", self.profile_id, mid)
+        if self.autosave and memory_ids:
+            self._log("bulk_delete_memories", f"{len(memory_ids)} записів")
+
+    def find_duplicate_memories(self, threshold: float = 0.93) -> List[Dict]:
+        return self.vector_db.find_near_duplicates(threshold)
+
     def update_memory(self, memory_id: str, new_text: str):
         if not self.access_control.check_permission("write"):
             raise PermissionError("Немає дозволу на запис")
@@ -1851,6 +1955,20 @@ class Orchestrator:
         self.initialize_personality(PersonalityConfig(**current))
         if self.autosave:
             self._log("apply_builtin_preset", preset_name)
+        return True
+
+    def personality_history(self) -> List[Dict]:
+        """Історія збережених версій особистості (найновіша перша)."""
+        return self._db_call("load_personality_snapshots", self.profile_id, default=[])
+
+    def revert_personality(self, snapshot_id: int) -> bool:
+        """Відкочує особистість до попередньої збереженої версії за її id."""
+        snapshots = self.personality_history()
+        snapshot = next((s for s in snapshots if s["id"] == snapshot_id), None)
+        if not snapshot:
+            return False
+        self.initialize_personality(PersonalityConfig(**snapshot["data"]))
+        self._log("revert_personality", str(snapshot_id))
         return True
 
     def save_text_as_memory(self, text: str, source: str = "chat") -> str:
@@ -2077,6 +2195,25 @@ def emotion_timeline(emotion_history: List[Dict]) -> List[Dict]:
 
 def memory_source_breakdown(memories: List[Dict]) -> Dict[str, int]:
     return dict(Counter(m.get("metadata", {}).get("source", "невідомо") for m in memories))
+
+
+def memory_growth_over_time(memories: List[Dict]) -> Dict[str, int]:
+    """Кумулятивна кількість спогадів за днями (на основі мітки created_at
+    у метаданих; спогади без мітки — напр. імпортовані до цього оновлення —
+    ігноруються замість спотворення графіка)."""
+    dated = sorted(
+        m.get("metadata", {}).get("created_at", "")[:10]
+        for m in memories
+        if m.get("metadata", {}).get("created_at")
+    )
+    if not dated:
+        return {}
+    counts: Dict[str, int] = {}
+    running = 0
+    for day in dated:
+        running += 1
+        counts[day] = running
+    return counts
 
 
 def conversation_activity_by_day(conversation_history: List[Dict]) -> Dict[str, int]:
