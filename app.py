@@ -20,12 +20,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from digital_twin_core import (
     Orchestrator, PersonalityConfig, SecurityLevel,
     BiometricProfile, LegacyProtocol, TwinDatabase,
-    PERSONALITY_PRESETS,
+    PERSONALITY_PRESETS, infer_personality_from_bio,
     emotion_distribution, memory_source_breakdown,
     conversation_activity_by_day, top_words,
     response_mode_breakdown, summary_stats,
     emotion_valence_timeline, activity_by_hour,
     message_length_stats, pinned_memories,
+    memory_growth_over_time,
 )
 
 
@@ -41,6 +42,7 @@ class _AnalyticsNamespace:
     activity_by_hour = staticmethod(activity_by_hour)
     message_length_stats = staticmethod(message_length_stats)
     pinned_memories = staticmethod(pinned_memories)
+    memory_growth_over_time = staticmethod(memory_growth_over_time)
 
 
 analytics = _AnalyticsNamespace()
@@ -492,9 +494,24 @@ else:
             caption = f"{emoji} {emotion}"
             if mode_label:
                 caption += f" · {mode_label}"
-            cap_col, btn_col = st.columns([5, 1])
+            cap_col, voice_col, btn_col = st.columns([4, 1, 1])
             with cap_col:
                 st.caption(caption)
+            with voice_col:
+                if msg_key and st.button("🔊", key="voice_" + msg_key, help="Синтезувати голос (демо-заглушка)"):
+                    if twin.voice.is_trained:
+                        try:
+                            synthesized = twin.voice.synthesize_speech(content, emotion)
+                            st.info(f"🔊 Демо-синтез (заглушка, не справжнє аудіо): {synthesized.decode()}")
+                        except Exception as e:
+                            st.error(f"Помилка синтезу: {e}")
+                    else:
+                        st.warning("Голос ще не навчено. Перейдіть у 🔒 Безпека або натисніть кнопку нижче для швидкого демо-навчання.")
+                        if st.button("🎙️ Швидко навчити голос (демо)", key="quicktrain_" + msg_key):
+                            for i in range(10):
+                                twin.voice.add_training_sample(f"demo_{i}".encode(), f"зразок {i}")
+                            st.success("Голос «навчено» (демо-режим)!")
+                            st.rerun()
             with btn_col:
                 if msg_key and st.button("💾", key="pin_" + msg_key, help="Зберегти цю репліку як спогад"):
                     with permission_guarded():
@@ -568,7 +585,7 @@ else:
         st.markdown("### 🧠 База знань та спогадів")
         st.caption(f"Embedding-бекенд: **{twin.vector_db.embedder.name}**")
 
-        tabs = st.tabs(["📚 Перегляд", "⭐ Закріплені", "➕ Імпорт", "🔍 Пошук", "📤 Повний експорт/імпорт"])
+        tabs = st.tabs(["📚 Перегляд", "⭐ Закріплені", "🔁 Дублікати", "➕ Імпорт", "🔍 Пошук", "📤 Повний експорт/імпорт"])
 
         with tabs[0]:
             memories = twin.vector_db.get_all_memories()
@@ -653,6 +670,34 @@ else:
                 st.info("Ще немає закріплених спогадів — натисніть ⭐ біля будь-якого запису у вкладці «Перегляд».")
 
         with tabs[2]:
+            st.markdown("#### 🔁 Можливі дублікати")
+            st.caption("Спогади з дуже схожим текстом — часто з'являються при повторному імпорті тих самих даних.")
+            dup_threshold = st.slider("Поріг схожості:", 0.80, 0.99, 0.93, 0.01,
+                                       help="Вищий поріг — лише майже ідентичні тексти вважаються дублікатами.")
+            duplicates = twin.find_duplicate_memories(threshold=dup_threshold)
+            if duplicates:
+                st.warning(f"Знайдено {len(duplicates)} пар(и) можливих дублікатів")
+                for i, dup in enumerate(duplicates):
+                    with st.expander(f"Схожість {dup['similarity']*100:.1f}% — {dup['text_a'][:50]}..."):
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            st.markdown("**Запис A:**")
+                            st.markdown(dup["text_a"])
+                            if st.button("🗑️ Видалити A", key=f"dupdel_a_{i}", use_container_width=True):
+                                with permission_guarded():
+                                    twin.delete_memory(dup["id_a"])
+                                    st.rerun()
+                        with col_b:
+                            st.markdown("**Запис B:**")
+                            st.markdown(dup["text_b"])
+                            if st.button("🗑️ Видалити B", key=f"dupdel_b_{i}", use_container_width=True):
+                                with permission_guarded():
+                                    twin.delete_memory(dup["id_b"])
+                                    st.rerun()
+            else:
+                st.success("Дублікатів не знайдено — пам'ять чиста!")
+
+        with tabs[3]:
             st.markdown("#### Імпорт спогадів")
             import_type = st.selectbox("Джерело даних:", ["Щоденник", "Повідомлення", "Календар", "Соцмережі", "Книги", "Email"])
             source_map = {"Щоденник": "diary", "Повідомлення": "messages", "Календар": "calendar",
@@ -682,7 +727,7 @@ else:
                 except Exception as e:
                     st.error("❌ Помилка: " + str(e))
 
-        with tabs[3]:
+        with tabs[4]:
             st.markdown("#### Пошук по спогадах")
             search_query = st.text_input("Запит:", placeholder="Наприклад: 'Карпати', 'робота', 'сім'я'")
             top_k = st.slider("Кількість результатів:", 1, 15, 5)
@@ -700,7 +745,7 @@ else:
                 else:
                     st.warning("Нічого не знайдено")
 
-        with tabs[4]:
+        with tabs[5]:
             st.markdown("#### Повний експорт / імпорт стану двійника")
             st.caption("Включає особистість, спогади, історію розмов та емоцій, налаштування спадщини.")
             level = st.selectbox("Рівень для експорту:", [SecurityLevel.PUBLIC, SecurityLevel.FAMILY,
@@ -767,6 +812,32 @@ else:
                 twin.save_personality_preset(new_preset_name)
                 st.success(f"Збережено пресет «{new_preset_name}»")
                 st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 🔍 Аналіз біографії")
+        st.caption("Легка евристична підказка: аналізує ключові слова у вашій біографії та пропонує "
+                   "орієнтовні значення формальності, гумору та стилю реакцій. Це відправна точка, не точний аналіз.")
+        if p.bio:
+            if st.button("🔍 Проаналізувати поточну біографію", use_container_width=True):
+                suggestion = infer_personality_from_bio(p.bio)
+                current = {
+                    "vocabulary_style": p.vocabulary_style, "favorite_phrases": p.favorite_phrases,
+                    "speech_formality": suggestion["speech_formality"], "humor_level": suggestion["humor_level"],
+                    "political_stance": p.political_stance, "religious_views": p.religious_views,
+                    "work_ethic": suggestion["work_ethic"], "family_values": p.family_values,
+                    "stress_reaction": suggestion["stress_reaction"], "joy_expression": p.joy_expression,
+                    "criticism_response": p.criticism_response, "common_words": p.common_words,
+                    "slang_terms": p.slang_terms, "bio": p.bio,
+                }
+                twin.initialize_personality(PersonalityConfig(**current))
+                st.success(
+                    f"Оновлено на основі аналізу: формальність {suggestion['speech_formality']:.2f}, "
+                    f"гумор {suggestion['humor_level']:.2f}, ставлення до роботи «{suggestion['work_ethic']}», "
+                    f"реакція на стрес «{suggestion['stress_reaction']}»"
+                )
+                st.rerun()
+        else:
+            st.caption("Спочатку заповніть поле «Біографія» у формі нижче, збережіть — і аналіз стане доступним.")
 
         if st.button("🎲 Згенерувати випадкову особистість (для тестування)"):
             import random
@@ -862,6 +933,25 @@ else:
             st.markdown("#### 👁️ Попередній перегляд промпту для LLM")
             st.code(twin.cognitive_engine.personality.to_prompt_context(), language="text")
 
+        st.markdown("---")
+        st.markdown("#### 🕒 Історія версій особистості")
+        st.caption("Кожна зміна особистості автоматично зберігається — можна повернутися до попередньої версії.")
+        history = twin.personality_history()
+        if history:
+            hist_options = {
+                f"{h['created_at'][:19].replace('T', ' ')} — bio: {(h['data'].get('bio') or '(порожньо)')[:40]}": h["id"]
+                for h in history
+            }
+            chosen_snapshot = st.selectbox("Оберіть версію:", list(hist_options.keys()), key="personality_history_select")
+            if st.button("⏪ Відкотитися до цієї версії", use_container_width=True):
+                if twin.revert_personality(hist_options[chosen_snapshot]):
+                    st.success("Особистість відновлено до обраної версії!")
+                    st.rerun()
+                else:
+                    st.error("Не вдалося відновити цю версію")
+        else:
+            st.caption("Історія версій ще порожня — з'явиться після першого збереження особистості.")
+
     # ========================================
     # TAB: SECURITY
     # ========================================
@@ -923,6 +1013,36 @@ else:
                     )
                     st.caption("Система розмежування доступу за ролями. Власник має повний доступ, "
                                "родина може читати й спілкуватися, гість — лише спілкуватися.")
+
+                st.markdown("---")
+                st.markdown("#### 👤 Власні облікові записи")
+                st.caption("Створіть окремі логіни для членів родини чи гостей, замість спільних демо-паролів.")
+
+                existing_custom = [u for u in registered_users if u["username"] not in {a[0] for a in twin.DEMO_ACCOUNTS}]
+                if existing_custom:
+                    st.markdown("**Зареєстровані:**")
+                    custom_role_labels = {"owner": "👑 Власник", "family": "👨‍👩‍👧 Родина", "guest": "🚶 Гість"}
+                    for u in existing_custom:
+                        st.markdown(f"- `{u['username']}` — {custom_role_labels.get(u['role'], u['role'])}")
+
+                with st.form("add_custom_user_form", clear_on_submit=True):
+                    new_col1, new_col2, new_col3 = st.columns(3)
+                    with new_col1:
+                        new_username = st.text_input("Новий логін:", placeholder="напр. tato")
+                    with new_col2:
+                        new_user_password = st.text_input("Пароль:", type="password")
+                    with new_col3:
+                        new_user_role = st.selectbox("Роль:", ["family", "guest", "owner"],
+                                                      format_func=lambda r: {"owner": "👑 Власник", "family": "👨‍👩‍👧 Родина", "guest": "🚶 Гість"}.get(r, r))
+                    add_user_submitted = st.form_submit_button("➕ Додати обліковий запис", use_container_width=True)
+
+                if add_user_submitted:
+                    if not new_username or not new_user_password:
+                        st.warning("Заповніть логін і пароль")
+                    else:
+                        twin.add_user(new_username, new_user_password, new_user_role)
+                        st.success(f"Обліковий запис «{new_username}» створено!")
+                        st.rerun()
 
             st.markdown("---")
             st.markdown("#### Рівні доступу")
@@ -1052,6 +1172,25 @@ else:
             else:
                 st.info("Бекап недоступний (персистентність вимкнена).")
 
+            st.markdown("---")
+            st.markdown("#### ⚠️ Небезпечна зона")
+            with st.expander("🗑️ Видалити профіль назавжди"):
+                st.error("Ця дія незворотна: буде видалено всі спогади, історію розмов, "
+                         "особистість і налаштування цього профілю. Спершу зробіть бекап вище, якщо потрібно.")
+                confirm_name = st.text_input(
+                    f"Щоб підтвердити, введіть назву профілю точно: «{twin.profile_name}»",
+                    key="delete_profile_confirm",
+                )
+                if st.button("🗑️ Видалити профіль остаточно", type="primary", use_container_width=True,
+                             disabled=(confirm_name != twin.profile_name)):
+                    with permission_guarded():
+                        twin.purge_all_data()
+                        st.session_state.authenticated = False
+                        st.session_state.twin = None
+                        st.session_state.chat_history = []
+                        st.success("Профіль видалено.")
+                        st.rerun()
+
     # ========================================
     # TAB: ANALYTICS
     # ========================================
@@ -1100,6 +1239,13 @@ else:
                 st.line_chart(activity)
             else:
                 st.info("Ще немає історії розмов.")
+
+            st.markdown("#### 📦 Зростання пам'яті в часі")
+            growth = analytics.memory_growth_over_time(memories)
+            if growth:
+                st.line_chart(growth)
+            else:
+                st.info("Недостатньо даних (спогади без мітки часу створення).")
 
             st.markdown("#### 🗣️ Найчастотніші слова у спогадах")
             words = analytics.top_words(memories)
